@@ -477,7 +477,7 @@ def _render_spectrum_plot(
         color_axes = None
     axes.set_facecolor("#111827")
     axes.set_title("Spectre SA100", color="#f9fafb")
-    axes.set_xlabel("Longueur d’onde (Å)", color="#e5e7eb")
+    #axes.set_xlabel("Longueur d’onde (Å)", color="#e5e7eb")
     axes.set_ylabel("Flux", color="#e5e7eb")
     axes.tick_params(colors="#d1d5db")
     axes.grid(color="#374151", alpha=0.8)
@@ -1219,6 +1219,15 @@ class QuickSpecFletApp:
                     "fits",
                     "fts",
                     "gz",
+                    "PNG",
+                    "JPG",
+                    "JPEG",
+                    "TIF",
+                    "TIFF",
+                    "FIT",
+                    "FITS",
+                    "FTS",
+                    "GZ",
                 ],
                 allow_multiple=False,
             )
