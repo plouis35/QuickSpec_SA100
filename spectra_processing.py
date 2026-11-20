@@ -30,6 +30,9 @@ class SpectrumResult:
         sky_strip: Rectified background pixels used for sky subtraction.
         angle_degrees: Applied image rotation angle.
         dispersion_angstrom_per_pixel: Linear wavelength scale.
+        spectrum_rows: Rows ``[low, high[`` of the spectrum band in the rectified image.
+        sky_rows: Rows ``[low, high[`` of the sky band in the rectified image.
+        x_start: First column of both bands in the rectified image.
     """
 
     wavelengths: NDArray[np.float64]
@@ -39,6 +42,9 @@ class SpectrumResult:
     sky_strip: ImageArray
     angle_degrees: float
     dispersion_angstrom_per_pixel: float
+    spectrum_rows: tuple[int, int] = (0, 0)
+    sky_rows: tuple[int, int] = (0, 0)
+    x_start: int = 0
 
 
 class Spectra:
@@ -108,20 +114,32 @@ class Spectra:
         if data.ndim != 2 or min(data.shape) < 10:
             raise ValueError("SA100 processing requires a 2D image at least 10x10.")
 
+        logger.info(
+            "Extraction : image %d × %d px (min=%.1f médiane=%.1f max=%.1f)",
+            data.shape[1], data.shape[0],
+            float(np.nanmin(data)), float(np.nanmedian(data)), float(np.nanmax(data)),
+        )
         x0, y0 = _point(order_zero, "order-zero point")
         x1, y1 = _point(dispersion_point, "dispersion point")
         xs, ys = _point(sky_point, "sky point")
+        logger.info(
+            "Points choisis : ordre 0=(%.1f, %.1f)  trace=(%.1f, %.1f)  ciel=(%.1f, %.1f)",
+            x0, y0, x1, y1, xs, ys,
+        )
         angle = compute_angle(x0, y0, x1, y1)
 
         rectified = _rotate_image(data, angle)
 
         height, width = rectified.shape
-        x0_rotated, y0_rotated = rotate_point(
-            x0, y0, (width - 1) / 2.0, (height - 1) / 2.0, angle
+        center_x, center_y = (width - 1) / 2.0, (height - 1) / 2.0
+        x0_rotated, y0_rotated = rotate_point(x0, y0, center_x, center_y, angle)
+        xs_rotated, sky_y_rotated = rotate_point(xs, ys, center_x, center_y, angle)
+        logger.info(
+            "Image tournée de %.2f° (angle de la trace) autour de (%.1f, %.1f) : ordre 0 → (%.1f, %.1f), "
+            "ciel → y=%.1f",
+            angle, center_x, center_y, x0_rotated, y0_rotated, sky_y_rotated,
         )
-        _, sky_y_rotated = rotate_point(
-            xs, ys, (width - 1) / 2.0, (height - 1) / 2.0, angle
-        )
+        logger.debug("Point de ciel après rotation : x=%.1f (non utilisé)", xs_rotated)
 
         spectrum_strip, sky_strip = crop_spectrum(
             rectified,
@@ -136,10 +154,15 @@ class Spectra:
 
         spectrum_1d = np.sum(spectrum_strip, axis=0, dtype=np.float64)
         sky_1d = np.sum(sky_strip, axis=0, dtype=np.float64)
-        flux = spectrum_1d - sky_1d * (
-            spectrum_strip.shape[0] / sky_strip.shape[0]
+        sky_scale = spectrum_strip.shape[0] / sky_strip.shape[0]
+        raw_flux = spectrum_1d - sky_1d * sky_scale
+        flux = np.clip(raw_flux, 0.0, None)
+        logger.info(
+            "Flux : somme de %d ligne(s) moins ciel (%d ligne(s), facteur %.3f) ; "
+            "%d valeur(s) négative(s) ramenée(s) à 0 ; max=%.1f médiane=%.1f",
+            spectrum_strip.shape[0], sky_strip.shape[0], sky_scale,
+            int(np.count_nonzero(raw_flux < 0)), float(flux.max()), float(np.median(flux)),
         )
-        flux = np.clip(flux, 0.0, None)
 
         dispersion = compute_dispersion(
             self.distance_mm,
@@ -150,6 +173,11 @@ class Spectra:
             np.arange(flux.size, dtype=np.float64) - self.order_zero_offset_px
         ) * dispersion
         keep = (wavelengths > self.lambda_min) & (wavelengths < self.lambda_max)
+        logger.info(
+            "Fenêtre λ ]%.0f, %.0f[ Å : %d pixel(s) conservé(s) sur %d (λ calculées %.0f à %.0f Å)",
+            self.lambda_min, self.lambda_max, int(np.count_nonzero(keep)), flux.size,
+            float(wavelengths[0]), float(wavelengths[-1]),
+        )
         if not np.any(keep):
             raise ValueError(
                 "No pixels fall in the configured wavelength range; "
@@ -164,12 +192,14 @@ class Spectra:
             sky_strip=sky_strip,
             angle_degrees=angle,
             dispersion_angstrom_per_pixel=dispersion,
+            spectrum_rows=strip_rows(height, y0_rotated, self.half_height),
+            sky_rows=strip_rows(height, sky_y_rotated, self.sky_half_height),
+            x_start=int(round(x0_rotated)),
         )
         logger.info(
-            "SA100 extraction: %d samples, %.2f Å/px, rotation %.2f°",
-            self.result.flux.size,
-            dispersion,
-            angle,
+            "Spectre extrait : %d échantillons, %.3f Å/px, λ %.0f–%.0f Å",
+            self.result.flux.size, dispersion,
+            float(self.result.wavelengths[0]), float(self.result.wavelengths[-1]),
         )
         return self.result
 
@@ -208,7 +238,7 @@ def compute_angle(x0: float, y0: float, x1: float, y1: float) -> float:
     if x0 == x1 and y0 == y1:
         raise ValueError("Order zero and dispersion point must be different.")
     angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
-    logger.info("SA100 dispersion angle: %.2f degrees", angle)
+    logger.info("Angle de la trace : %.2f° (de l'ordre 0 vers le 2e point)", angle)
     return angle
 
 
@@ -237,6 +267,21 @@ def rotate_point(
         center_x + dx * math.cos(radians) - dy * math.sin(radians),
         center_y + dx * math.sin(radians) + dy * math.cos(radians),
     )
+
+
+def strip_rows(height: int, center_y: float, half_height: int) -> tuple[int, int]:
+    """Rows ``[low, high[`` of a horizontal band centred on ``center_y``, clipped to the image.
+
+    Args:
+        height: Image height in pixels.
+        center_y: Vertical centre of the band.
+        half_height: Half-height of the band in pixels.
+
+    Returns:
+        The first row and the row after the last one.
+    """
+    center = int(round(center_y))
+    return max(0, center - half_height), min(height, center + half_height)
 
 
 def crop_spectrum(
@@ -270,10 +315,20 @@ def crop_spectrum(
 
     spectrum_center = int(round(y0_rotated))
     sky_center = int(round(sky_y_rotated))
-    spectrum_low = max(0, spectrum_center - half_height)
-    spectrum_high = min(height, spectrum_center + half_height)
-    sky_low = max(0, sky_center - sky_half_height)
-    sky_high = min(height, sky_center + sky_half_height)
+    spectrum_low, spectrum_high = strip_rows(height, y0_rotated, half_height)
+    sky_low, sky_high = strip_rows(height, sky_y_rotated, sky_half_height)
+    logger.info(
+        "Bandes (image tournée) : spectre y=[%d, %d[ centré sur %d (±%d), "
+        "ciel y=[%d, %d[ centré sur %d (±%d), départ x=%d",
+        spectrum_low, spectrum_high, spectrum_center, half_height,
+        sky_low, sky_high, sky_center, sky_half_height, x_start,
+    )
+    if spectrum_high - spectrum_low < 2 * half_height:
+        logger.warning("Bande du spectre tronquée par le bord de l'image")
+    if sky_high - sky_low < 2 * sky_half_height:
+        logger.warning("Bande de ciel tronquée par le bord de l'image")
+    if spectrum_low < sky_high and sky_low < spectrum_high:
+        logger.warning("Les bandes spectre et ciel se chevauchent : le ciel contient du signal")
 
     return (
         image[spectrum_low:spectrum_high, x_start:].copy(),
@@ -306,7 +361,15 @@ def compute_dispersion(
     if not 0 < sin_theta < 1:
         raise ValueError("Grating period must be greater than 550 nm.")
     cos_theta = math.sqrt(1.0 - sin_theta**2)
-    return grating_period_nm * cos_theta * (pixel_size_um / 1000.0) / distance_mm * 10.0
+    dispersion = (
+        grating_period_nm * cos_theta * (pixel_size_um / 1000.0) / distance_mm * 10.0
+    )
+    logger.info(
+        "Dispersion : période %.0f nm, pixel %.2f µm, distance %.1f mm, "
+        "cosθ(550 nm)=%.4f → %.3f Å/px",
+        grating_period_nm, pixel_size_um, distance_mm, cos_theta, dispersion,
+    )
+    return dispersion
 
 
 def _rotate_image(
@@ -323,6 +386,7 @@ def _rotate_image(
         Rotated float32 image with the same shape as the input.
     """
     height, width = image.shape
+    logger.debug("Rotation bilinéaire %.2f° par blocs de %d lignes", angle_degrees, block_rows)
     center_x = (width - 1) / 2.0
     center_y = (height - 1) / 2.0
     radians = math.radians(angle_degrees)

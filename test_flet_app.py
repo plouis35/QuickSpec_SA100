@@ -12,6 +12,7 @@ import flet as ft
 import numpy as np
 from PIL import Image as PillowImage
 
+from plotting import display_limits
 from flet_app import (
     AppParameters,
     ELEMENT_LINE_COLORS,
@@ -165,7 +166,7 @@ class FletImageTests(unittest.TestCase):
             ),
         )
         with patch(
-            "flet_app._visible_spectrum_rgb",
+            "plotting._visible_spectrum_rgb",
             wraps=_visible_spectrum_rgb,
         ) as visible_colors:
             uri = spectrum_png_data_uri(
@@ -236,6 +237,7 @@ class FletImageTests(unittest.TestCase):
         """Display logger output in color and clear the Logs tab."""
         app = QuickSpecFletApp()
         app.build(FakePage())
+        app._clear_logs()  # écarte les logs de démarrage
 
         with patch.object(app.page, "update"):
             logging.getLogger("image_processing").info("test log entry")
@@ -253,6 +255,7 @@ class FletImageTests(unittest.TestCase):
         """Color log levels and toggle DEBUG and TRACE visibility."""
         app = QuickSpecFletApp()
         app.build(FakePage())
+        app._clear_logs()  # écarte les logs de démarrage
         image_logger = logging.getLogger("image_processing")
         event = ft.ControlEvent(name="on_change", control=app.debug_checkbox)
 
@@ -399,6 +402,7 @@ class FletImageTests(unittest.TestCase):
                     patch.object(page, "update"),
                     patch.object(app.spectrum_image, "update"),
                     patch.object(app.image_status, "update"),
+                    patch.object(app.image_stack, "update"),
                     patch(
                         "flet_app._render_spectrum_plot",
                         wraps=_render_spectrum_plot,
@@ -545,11 +549,11 @@ class FletImageTests(unittest.TestCase):
         image_data = np.ones((20, 20), dtype=np.float32)
         app.image_processor.load = lambda _paths: image_data
         app._refresh_image_controls = lambda _data=None: None
-        app._update_spectrum_image = lambda: None
 
         with (
             patch.object(app.image_status, "update"),
             patch.object(app.spectrum_status, "update"),
+            patch.object(app.spectrum_image, "update"),
         ):
             app._load_image(image_path)
 
@@ -574,7 +578,6 @@ class FletImageTests(unittest.TestCase):
             lambda_min=0,
             lambda_max=10000,
         )
-        app._update_spectrum_image = lambda: None
         app.selecting = True
         scale = min(app.stage_size[0] / image.shape[1], app.stage_size[1] / image.shape[0])
         left = (app.stage_size[0] - image.shape[1] * scale) / 2
@@ -597,7 +600,13 @@ class FletImageTests(unittest.TestCase):
 
         self.assertIsNotNone(app.spectra_processor.result)
         self.assertGreater(app.spectra_processor.result.flux.size, 0)
-        self.assertEqual(app.tabs.selected_index, 1)
+        self.assertEqual(app.tabs.selected_index, 0)  # on reste sur l'image
+        self.assertTrue(app.show_rectified)
+        self.assertTrue(app.rectified_checkbox.value)
+        lines = [c for c in app.image_stack.controls if isinstance(c, ft.Container)]
+        self.assertEqual(len(lines), 4)  # 2 lignes spectre + 2 lignes ciel
+        self.assertEqual({c.bgcolor for c in lines}, {"#ff2020", "#3b82f6"})
+        self.assertEqual(len(app.image_stack.controls), 5)  # image + 4 lignes, plus de croix
 
     def test_last_picker_directory_is_persisted(self) -> None:
         """Persist the most recently used image directory."""
@@ -609,6 +618,83 @@ class FletImageTests(unittest.TestCase):
             app._save_last_directory()
 
             self.assertEqual(app.location_file.read_text(), directory)
+
+
+class DynamicSizeTests(unittest.TestCase):
+    """Vérifie que image et graphe suivent la taille mesurée de leur conteneur."""
+
+    def test_spectrum_plot_png_has_requested_size(self) -> None:
+        """Le PNG du graphe a la taille demandée (à un pixel près)."""
+        uri, _ = _render_spectrum_plot(size_px=(1100, 600))
+        decoded = base64.b64decode(uri.removeprefix("data:image/png;base64,"))
+        with PillowImage.open(BytesIO(decoded)) as chart:
+            self.assertEqual(chart.size, (1100, 600))
+
+    def test_spectrum_size_change_rerenders_once_per_real_change(self) -> None:
+        """Re-rend le graphe à la nouvelle taille, mais pas pour une variation < 2 px."""
+        app = QuickSpecFletApp()
+        app.build(FakePage())
+
+        def event(width: float, height: float) -> ft.LayoutSizeChangeEvent:
+            return ft.LayoutSizeChangeEvent(
+                name="on_size_change", control=app.spectrum_gesture, width=width, height=height
+            )
+
+        with (
+            patch.object(app.spectrum_image, "update"),
+            patch("flet_app._render_spectrum_plot", wraps=_render_spectrum_plot) as render,
+        ):
+            app._on_spectrum_plot_size_change(event(900, 500))
+            app._on_spectrum_plot_size_change(event(900.5, 500.5))
+            app._on_spectrum_plot_size_change(event(0, 0))  # onglet masqué
+            app._on_spectrum_plot_size_change(event(1200, 700))
+
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(render.call_args_list[0].kwargs["size_px"], (900.0, 500.0))
+        self.assertEqual(render.call_args_list[1].kwargs["size_px"], (1200.0, 700.0))
+
+    def test_image_stage_follows_measured_size(self) -> None:
+        """La zone image prend la taille mesurée du conteneur, et ignore une taille nulle."""
+        app = QuickSpecFletApp()
+        app.build(FakePage())
+        with patch.object(app.image_stack, "update"):
+            app._on_image_stage_size_change(
+                ft.LayoutSizeChangeEvent(name="on_size_change", control=None, width=1000, height=640)
+            )
+            app._on_image_stage_size_change(
+                ft.LayoutSizeChangeEvent(name="on_size_change", control=None, width=0, height=0)
+            )
+        self.assertEqual(app.stage_size, (1000.0, 640.0))
+        self.assertEqual((app.image_stack.width, app.image_stack.height), (1000.0, 640.0))
+
+    def test_parameters_missing_keys_use_defaults(self) -> None:
+        """Un ancien fichier JSON sans nouvelle clé reste lisible."""
+        parameters = AppParameters.from_mapping({"focal_mm": 85})
+        self.assertEqual(parameters.focal_mm, 85)
+        self.assertEqual(parameters.star_analyser, 200)
+
+
+class ContrastTests(unittest.TestCase):
+    """L'image transformée doit avoir le même contraste que l'image d'origine."""
+
+    def test_rectified_preview_uses_original_stretch(self) -> None:
+        """Les coins noirs de la rotation ne doivent pas éclaircir l'aperçu."""
+        original = np.full((50, 50), 100.0, dtype=np.float32)
+        original[20:30, 20:30] = 400.0
+        rectified = original.copy()
+        rectified[:15] = 0.0  # coins vides créés par la rotation
+
+        def background_gray(data, limits=None) -> int:
+            decoded = base64.b64decode(image_png_data_uri(data, limits).split(",")[1])
+            with PillowImage.open(BytesIO(decoded)) as image:
+                return image.getpixel((40, 40))
+
+        shared = display_limits(original)
+        self.assertEqual(
+            background_gray(original), background_gray(rectified, shared)
+        )
+        # sans bornes communes, le fond apparaît nettement plus clair
+        self.assertGreater(background_gray(rectified), background_gray(original) + 20)
 
 
 if __name__ == "__main__":
