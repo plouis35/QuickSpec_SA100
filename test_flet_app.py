@@ -785,5 +785,70 @@ class MultiImageLoadingTests(unittest.TestCase):
         self.assertEqual(self.app.spectra_processor.sky_height, 15)
 
 
+class ContrastCutsTests(unittest.TestCase):
+    """Curseurs de contraste (noir/blanc en percentiles)."""
+
+    def test_cut_scale_endpoints_and_inverse(self) -> None:
+        from plotting import cut_percentile, cut_position
+
+        self.assertAlmostEqual(cut_percentile(0), 0.0)
+        self.assertAlmostEqual(cut_percentile(100), 100.0)
+        for percentile in (0.5, 20.0, 50.0, 99.0, 99.5, 99.9):
+            self.assertAlmostEqual(cut_percentile(cut_position(percentile)), percentile, places=6)
+        # l'échelle est dilatée près de 100 % : 99–100 % occupe ~14 % de la course
+        self.assertGreater(100 - cut_position(99.0), 10)
+
+    def test_cut_limits_are_robust_to_hot_pixels(self) -> None:
+        from plotting import cut_limits, cut_sample
+
+        image = np.random.default_rng(0).normal(1000, 20, (200, 300)).astype(np.float32)
+        image[10, 10] = 1e6  # pixel chaud
+        low, high = cut_limits(cut_sample(image), 0.5, 99.5)
+        self.assertLess(high, 1200)
+        self.assertLess(low, high)
+
+    def test_sample_is_bounded_and_reproducible(self) -> None:
+        from plotting import CUT_SAMPLE_SIZE, cut_sample
+
+        image = np.arange(2000 * 1000, dtype=np.float32).reshape(1000, 2000)
+        first, second = cut_sample(image), cut_sample(image)
+        self.assertEqual(first.size, CUT_SAMPLE_SIZE)
+        np.testing.assert_array_equal(first, second)
+
+    def test_toolbar_order_buttons_slider_checkbox(self) -> None:
+        app = QuickSpecFletApp()
+        app.build(FakePage())
+        toolbar = app.tabs.content.controls[1].controls[0].controls[0].controls
+        self.assertEqual(toolbar[0].content, "Ouvrir une image")
+        self.assertEqual(toolbar[1].content, "Sélection SA100")
+        self.assertIn(app.cut_slider, toolbar[2].controls)
+        self.assertIs(toolbar[3], app.rectified_checkbox)
+
+    def test_slider_release_recomputes_levels_and_auto_restores_them(self) -> None:
+        from plotting import cut_position
+
+        app = QuickSpecFletApp()
+        app.build(FakePage())
+        image = np.linspace(0, 1000, 100 * 100, dtype=np.float32).reshape(100, 100)
+        app.image_processor.data = image
+        app.image_shape = image.shape
+        with (
+            patch.object(app.page, "update"),
+            patch.object(app.image_stack, "update"),
+            patch.object(app.cut_text, "update"),
+        ):
+            auto = app._stretch_limits()
+            app.cut_slider.start_value, app.cut_slider.end_value = 20.0, 60.0
+            app._on_cuts_changed(ft.ControlEvent(name="on_change_end", control=app.cut_slider))
+            changed = app._stretch_limits()
+            self.assertGreater(changed[0], auto[0])
+            self.assertLess(changed[1], auto[1])
+
+            app._on_cuts_auto(ft.ControlEvent(name="on_click", control=None))
+            restored = app._stretch_limits()
+        self.assertEqual(restored, auto)
+        self.assertAlmostEqual(app.cut_slider.end_value, cut_position(99.5))
+
+
 if __name__ == "__main__":
     unittest.main()

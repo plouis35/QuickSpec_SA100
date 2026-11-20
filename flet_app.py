@@ -23,7 +23,11 @@ from plotting import (  # noqa: F401  (certains noms sont ré-exportés pour les
     VALID_LINE_TYPES,
     SpectrumTrace,
     WavelengthLimits,
-    display_limits,
+    AUTO_CUT_PERCENTILES,
+    cut_limits,
+    cut_percentile,
+    cut_position,
+    cut_sample,
     _render_spectrum_plot,
     _visible_spectrum_rgb,
     image_bounds,
@@ -183,7 +187,12 @@ class QuickSpecFletApp:
         self.stage_size: StageSize = (800.0, 480.0)  # zone image, remplacée par la mesure
         self._stage_measured = False
         self._previews: list[tuple[object, str]] = []  # cache (tableau source, data URI)
-        self._display_limits: tuple[object, tuple[float, float]] | None = None  # (image d'origine, bornes)
+        self._cut_source: object | None = None  # image d'origine dont on a tiré l'échantillon
+        self._cut_sample: np.ndarray | None = None
+        self._display_limits: tuple[float, float] | None = None
+        self.cut_positions: tuple[float, float] = self._auto_cut_positions()
+        self.cut_slider: ft.RangeSlider | None = None
+        self.cut_text: ft.Text | None = None
         self.show_rectified = False  # afficher l'image transformée + bandes de binning
         self.rectified_checkbox: ft.Checkbox | None = None
 
@@ -262,6 +271,14 @@ class QuickSpecFletApp:
         self.rectified_checkbox = ft.Checkbox(
             label="Image transformée", value=False, on_change=self._on_rectified_toggle
         )
+        low, high = self.cut_positions
+        self.cut_slider = ft.RangeSlider(
+            min=0, max=100, start_value=low, end_value=high, width=220,
+            tooltip="Niveaux noir / blanc (percentiles de l’image)",
+            on_change=self._on_cuts_moving,
+            on_change_end=self._on_cuts_changed,
+        )
+        self.cut_text = ft.Text(self._cut_label(), size=12, width=88)
         return ft.Column(
             expand=True,
             spacing=8,
@@ -271,14 +288,20 @@ class QuickSpecFletApp:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
                         ft.Button("Ouvrir une image", icon=ft.Icons.FOLDER_OPEN, on_click=self._open_picker),
-                        ft.Row(  # bouton + case restent côte à côte, même quand la ligne se replie
+                        ft.Button("Sélection SA100", icon=ft.Icons.TOUCH_APP, on_click=self._begin_selection),
+                        ft.Row(  # curseurs de contraste : restent groupés quand la ligne se replie
                             tight=True,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             controls=[
-                                ft.Button("Sélection SA100", icon=ft.Icons.TOUCH_APP, on_click=self._begin_selection),
-                                self.rectified_checkbox,
+                                self.cut_slider,
+                                self.cut_text,
+                                ft.IconButton(
+                                    ft.Icons.AUTO_FIX_HIGH, tooltip="Contraste automatique",
+                                    on_click=self._on_cuts_auto,
+                                ),
                             ],
                         ),
+                        self.rectified_checkbox,
                         ft.Text("Pince pour zoomer · glisse pour déplacer", size=12),
                     ],
                 ),
@@ -671,6 +694,9 @@ class QuickSpecFletApp:
         self.selecting = False
         self.spectra_processor.result = None
         self._previews.clear()
+        self._cut_source = None  # nouvel échantillon pour les curseurs
+        if not keep_selection:
+            self._reset_cuts()
         self._display_limits = None
         self._set_show_rectified(False)
         finite = data[np.isfinite(data)]
@@ -698,20 +724,74 @@ class QuickSpecFletApp:
         self._previews = (self._previews + [(data, uri)])[-2:]  # image d'origine + transformée
         return uri
 
-    def _stretch_limits(self) -> tuple[float, float] | None:
-        """Bornes de contraste de l'image d'origine, utilisées aussi pour l'image transformée.
+    @staticmethod
+    def _auto_cut_positions() -> tuple[float, float]:
+        return tuple(cut_position(p) for p in AUTO_CUT_PERCENTILES)
 
-        Sans cela, les coins noirs ajoutés par la rotation faussent les percentiles
-        et l'image transformée paraît plus claire que l'originale.
+    def _cut_percentiles(self) -> tuple[float, float]:
+        return cut_percentile(self.cut_positions[0]), cut_percentile(self.cut_positions[1])
+
+    def _cut_label(self) -> str:
+        low, high = self._cut_percentiles()
+        return f"{low:.1f} – {high:.2f} %"
+
+    def _stretch_limits(self) -> tuple[float, float] | None:
+        """Niveaux noir/blanc de l'image d'origine, communs à l'image transformée.
+
+        Ils viennent des curseurs (percentiles de l'image d'origine). Sans bornes communes,
+        les coins noirs ajoutés par la rotation faussent le contraste et l'image transformée
+        paraît plus claire que l'originale.
         """
         original = self.image_processor.data
         if original is None:
             return None
-        if self._display_limits is None or self._display_limits[0] is not original:
-            limits = display_limits(original)
-            logger.info("Contraste d'affichage : noir=%.1f blanc=%.1f (commun aux deux images)", *limits)
-            self._display_limits = (original, limits)
-        return self._display_limits[1]
+        if self._cut_source is not original:
+            self._cut_source = original
+            self._cut_sample = cut_sample(original)
+            self._display_limits = None
+        if self._display_limits is None:
+            if not self._cut_sample.size:
+                return None
+            low_p, high_p = self._cut_percentiles()
+            self._display_limits = cut_limits(self._cut_sample, low_p, high_p)
+            logger.info(
+                "Contraste : percentiles %.2f %% – %.2f %% → noir=%.1f blanc=%.1f (commun aux deux images)",
+                low_p, high_p, *self._display_limits,
+            )
+        return self._display_limits
+
+    def _reset_cuts(self) -> None:
+        """Remet les curseurs au contraste automatique."""
+        self.cut_positions = self._auto_cut_positions()
+        self._display_limits = None
+        if self.cut_slider is not None:
+            self.cut_slider.start_value, self.cut_slider.end_value = self.cut_positions
+        if self.cut_text is not None:
+            self.cut_text.value = self._cut_label()
+
+    def _on_cuts_moving(self, event: ft.ControlEvent) -> None:
+        """Pendant le glissé : met à jour seulement l'affichage des percentiles (pas de re-rendu)."""
+        self.cut_positions = (float(self.cut_slider.start_value), float(self.cut_slider.end_value))
+        self.cut_text.value = self._cut_label()
+        self.cut_text.update()
+
+    def _on_cuts_changed(self, event: ft.ControlEvent) -> None:
+        """Au relâchement : recalcule les niveaux noir/blanc et redessine l'image."""
+        self.cut_positions = (float(self.cut_slider.start_value), float(self.cut_slider.end_value))
+        self._apply_cuts()
+
+    def _on_cuts_auto(self, _event: ft.ControlEvent) -> None:
+        logger.info("Contraste automatique")
+        self._reset_cuts()
+        self._apply_cuts()
+
+    def _apply_cuts(self) -> None:
+        self.cut_text.value = self._cut_label()
+        self._display_limits = None
+        self._previews.clear()  # les aperçus PNG dépendent des niveaux
+        self._refresh_image_controls()
+        if self.page is not None:
+            self.page.update()
 
     def _display_data(self) -> ArrayLike | None:
         """Image affichée : l'image transformée après extraction, sinon l'originale."""

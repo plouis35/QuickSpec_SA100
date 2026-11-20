@@ -146,6 +146,41 @@ def display_limits(data: ArrayLike) -> tuple[float, float]:
     return low, high
 
 
+# Curseurs de contraste : position 0–100 → percentile 0–100, avec une échelle dilatée près de
+# 100 % (le spectre est une toute petite fraction des pixels : un curseur linéaire ne
+# permettrait pas de régler finement entre 99 et 100 %). 0 → 0 %, 100 → 100 %.
+CUT_EXPONENT = 3.0
+AUTO_CUT_PERCENTILES = (0.5, 99.5)
+CUT_SAMPLE_SIZE = 1_000_000
+
+
+def cut_percentile(position: float) -> float:
+    """Percentile (0–100) correspondant à la position d'un curseur (0–100)."""
+    return 100.0 * (1.0 - (1.0 - position / 100.0) ** CUT_EXPONENT)
+
+
+def cut_position(percentile: float) -> float:
+    """Position de curseur (0–100) correspondant à un percentile (0–100)."""
+    return 100.0 * (1.0 - (1.0 - percentile / 100.0) ** (1.0 / CUT_EXPONENT))
+
+
+def cut_sample(data: ArrayLike) -> NDArray[np.float32]:
+    """Échantillon (au plus 1 M pixels finis, tirage reproductible) pour calculer les percentiles vite."""
+    image = np.asarray(data, dtype=np.float32)
+    finite = image[np.isfinite(image)]
+    if finite.size > CUT_SAMPLE_SIZE:
+        finite = finite[np.random.default_rng(0).integers(0, finite.size, CUT_SAMPLE_SIZE)]
+    return finite
+
+
+def cut_limits(sample: NDArray[np.float32], low_percentile: float, high_percentile: float) -> tuple[float, float]:
+    """Niveaux noir et blanc pour deux percentiles de l'échantillon (blanc > noir garanti)."""
+    low, high = (float(v) for v in np.percentile(sample, (low_percentile, high_percentile)))
+    if high <= low:
+        high = low + 1
+    return low, high
+
+
 def image_png_data_uri(data: ArrayLike, limits: tuple[float, float] | None = None) -> str:
     """Aperçu PNG (niveaux de gris) sous forme de data URI.
 
