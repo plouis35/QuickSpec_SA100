@@ -208,6 +208,28 @@ class FletImageTests(unittest.TestCase):
         self.assertTrue(render_spectrum.call_args.kwargs["show_color_band"])
         self.assertTrue(render_spectrum.call_args.kwargs["show_element_lines"])
 
+    def test_tabs_change_only_by_tap_not_by_swipe(self) -> None:
+        """Pas de TabBarView (balayage) ; une seule page visible, choisie par l'onglet."""
+        with TemporaryDirectory() as directory:
+            with patch("pathlib.Path.home", return_value=Path(directory)):
+                app = QuickSpecFletApp()
+                tabs = app.build(FakePage())
+
+                def contains_tab_bar_view(control: object) -> bool:
+                    if isinstance(control, ft.TabBarView):
+                        return True
+                    children = getattr(control, "controls", None) or []
+                    inner = getattr(control, "content", None)
+                    return any(contains_tab_bar_view(c) for c in children) or (
+                        inner is not None and contains_tab_bar_view(inner)
+                    )
+
+                self.assertFalse(contains_tab_bar_view(tabs))
+                self.assertEqual([v.visible for v in app.tab_pages], [True, False, False, False])
+                tabs.selected_index = 2
+                app._on_tab_change(None)
+                self.assertEqual([v.visible for v in app.tab_pages], [False, False, True, False])
+
     def test_app_builds_four_tabs_and_registers_picker(self) -> None:
         """Build all application tabs and register the file picker service."""
         with TemporaryDirectory() as directory:
@@ -818,7 +840,7 @@ class ContrastCutsTests(unittest.TestCase):
     def test_toolbar_order_buttons_slider_checkbox(self) -> None:
         app = QuickSpecFletApp()
         app.build(FakePage())
-        toolbar = app.tabs.content.controls[1].controls[0].controls[0].controls
+        toolbar = app.tab_pages[0].controls[0].controls
         self.assertEqual(toolbar[0].content, "Ouvrir une image")
         self.assertEqual(toolbar[1].content, "Sélection SA100")
         self.assertIn(app.cut_slider, toolbar[2].controls)

@@ -172,6 +172,7 @@ class QuickSpecFletApp:
         self.log_handler: FletLogHandler | None = None
         self.picker: ft.FilePicker | None = None
         self.tabs: ft.Tabs | None = None
+        self.tab_pages: list[ft.Control] = []
 
         self.location_file = Path.home() / ".quickspec-sa100" / "last-image-location.txt"
         self.parameters_file = Path.home() / ".quickspec-sa100" / "parameters.json"
@@ -212,6 +213,15 @@ class QuickSpecFletApp:
         self.picker = ft.FilePicker()
         page.services.append(self.picker)
 
+        self.tab_pages: list[ft.Control] = [
+            self._build_image_tab(),
+            self._build_spectrum_tab(),
+            self._build_parameters_tab(),
+            self._build_logs_tab(),
+        ]
+        for index, view in enumerate(self.tab_pages):
+            view.expand = True
+            view.visible = index == 0
         self.tabs = ft.Tabs(
             length=4,
             selected_index=0,
@@ -228,15 +238,10 @@ class QuickSpecFletApp:
                             ft.Tab(label=ft.Text("Logs"), icon=ft.Icons.TERMINAL),
                         ]
                     ),
-                    ft.TabBarView(
-                        expand=True,
-                        controls=[
-                            self._build_image_tab(),
-                            self._build_spectrum_tab(),
-                            self._build_parameters_tab(),
-                            self._build_logs_tab(),
-                        ],
-                    ),
+                    # Pas de TabBarView : il change d'onglet au glissement du doigt, ce qui
+                    # gêne le zoom à deux doigts sur l'image. Seul un appui sur l'icône
+                    # d'un onglet change maintenant de page (voir _apply_tab_visibility).
+                    *self.tab_pages,
                 ],
             ),
         )
@@ -601,10 +606,21 @@ class QuickSpecFletApp:
         """Rafraîchit le contenu de l'onglet qui devient visible (taille parfois nulle avant)."""
         index = self.tabs.selected_index if self.tabs else None
         logger.debug("Onglet %s affiché", index)
+        self._apply_tab_visibility()
         if index == 0:
             self._refresh_image_controls()
         elif index == 1:
             self._render_spectrum()
+
+    def _apply_tab_visibility(self) -> None:
+        """N'affiche que la page de l'onglet sélectionné (changement uniquement par appui)."""
+        if self.tabs is None:
+            return
+        selected = self.tabs.selected_index or 0
+        for index, view in enumerate(self.tab_pages):
+            view.visible = index == selected
+        if self.page is not None:
+            self.page.update()
 
     def _on_image_stage_size_change(self, event: ft.LayoutSizeChangeEvent) -> None:
         """Adapte la zone image à la taille réellement mesurée de son conteneur."""
@@ -947,6 +963,7 @@ class QuickSpecFletApp:
         if navigate_to_spectrum and self.page and self.tabs:
             logger.info("Passage à l'onglet Spectre")
             self.tabs.selected_index = 1
+            self._apply_tab_visibility()
         if self.page is not None:
             self.page.update()
 
