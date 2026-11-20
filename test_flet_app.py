@@ -547,15 +547,16 @@ class FletImageTests(unittest.TestCase):
         )
         image_path = Path("/tmp/quickspec-preserve-traces.png")
         image_data = np.ones((20, 20), dtype=np.float32)
-        app.image_processor.load = lambda _paths: image_data
+        app.image_processor.load_stack = lambda _paths, **_masters: image_data
         app._refresh_image_controls = lambda _data=None: None
 
         with (
+            patch("flet_app.load_masters", return_value={"offset": None, "dark": None, "flat": None}),
             patch.object(app.image_status, "update"),
             patch.object(app.spectrum_status, "update"),
             patch.object(app.spectrum_image, "update"),
         ):
-            app._load_image(image_path)
+            app._load_images([image_path])
 
         self.assertEqual(len(app.spectrum_traces), 1)
         with patch.object(app.spectrum_image, "update"):
@@ -695,6 +696,93 @@ class ContrastTests(unittest.TestCase):
         )
         # sans bornes communes, le fond apparaît nettement plus clair
         self.assertGreater(background_gray(rectified), background_gray(original) + 20)
+
+
+class MultiImageLoadingTests(unittest.TestCase):
+    """Chargement de plusieurs images avec masters dans l'application."""
+
+    def setUp(self) -> None:
+        from test_stacking import save_gray16, star_field
+
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        shape = (160, 240)
+        save_gray16(self.directory / "master_offset.png", np.full(shape, 100))
+        save_gray16(self.directory / "master_dark.png", np.full(shape, 20))
+        save_gray16(self.directory / "master_flat.png", np.full(shape, 4000))
+        self.paths = [
+            save_gray16(self.directory / f"light{i}.png", star_field(dy=dy, dx=dx, seed=i) + 120)
+            for i, (dy, dx) in enumerate([(0, 0), (3.0, -2.0), (-4.0, 5.0)])
+        ]
+        self.app = QuickSpecFletApp()
+        self.page = FakePage()
+        self.app.build(self.page)
+        self.app.parameters_file = self.directory / "parameters.json"
+        self.updates = (
+            patch.object(self.page, "update"),
+            patch.object(self.app.image_status, "update"),
+            patch.object(self.app.spectrum_status, "update"),
+            patch.object(self.app.spectrum_image, "update"),
+            patch.object(self.app.image_stack, "update"),
+        )
+        for update in self.updates:
+            update.start()
+            self.addCleanup(update.stop)
+
+    def test_masters_are_applied_and_frames_registered_and_summed(self) -> None:
+        self.app._load_images(self.paths)
+
+        processor = self.app.image_processor
+        self.assertEqual(processor.applied_corrections, ["offset", "dark", "flat"])
+        self.assertAlmostEqual(processor.registration_shifts[1][0], -3.0, delta=0.15)
+        self.assertAlmostEqual(processor.registration_shifts[1][1], 2.0, delta=0.15)
+        self.assertAlmostEqual(processor.registration_shifts[2][0], 4.0, delta=0.15)
+        self.assertAlmostEqual(processor.registration_shifts[2][1], -5.0, delta=0.15)
+        self.assertEqual(self.app.current_image_label, "light0.png (+2)")
+        status = self.app.image_status.value
+        self.assertIn("3 images recalées et additionnées", status)
+        self.assertIn("corrections : offset, dark, flat", status)
+
+    def test_missing_master_logs_a_warning_and_load_continues(self) -> None:
+        (self.directory / "master_dark.png").unlink()
+        with self.assertLogs("calibration", "WARNING") as logs:
+            self.app._load_images(self.paths[:1])
+        self.assertTrue(any("Master dark introuvable" in line for line in logs.output))
+        self.assertEqual(self.app.image_processor.applied_corrections, ["offset", "flat"])
+        self.assertIn("corrections : offset, flat", self.app.image_status.value)
+
+    def test_masters_directory_parameter_overrides_the_image_folder(self) -> None:
+        masters = self.directory / "masters"
+        masters.mkdir()
+        for name in ("master_offset.png", "master_dark.png", "master_flat.png"):
+            (self.directory / name).rename(masters / name)
+        with self.assertLogs("calibration", "WARNING"):
+            self.app._load_images(self.paths[:1])  # masters introuvables à côté de l'image
+        self.assertEqual(self.app.image_processor.applied_corrections, [])
+
+        self.app.parameters = AppParameters(calibration_dir=str(masters))
+        self.app._load_images(self.paths[:1])
+        self.assertEqual(self.app.image_processor.applied_corrections, ["offset", "dark", "flat"])
+
+    def test_changing_a_master_name_reloads_images_and_keeps_the_selection(self) -> None:
+        self.app._load_images(self.paths[:1])
+        self.app.selection_points[:] = [(50.0, 40.0), (180.0, 40.0), (180.0, 20.0)]
+        self.app.dark_name_field.value = ""  # désactive le dark
+
+        with patch.object(self.app, "_extract_spectrum") as extract:
+            self.app._apply_and_save_parameters(ft.ControlEvent(name="on_click", control=None))
+
+        self.assertEqual(self.app.image_processor.applied_corrections, ["offset", "flat"])
+        self.assertEqual(len(self.app.selection_points), 3)
+        extract.assert_called_once()
+
+    def test_band_thickness_parameters_reach_the_spectra_processor(self) -> None:
+        self.app.spectrum_height_field.value = "7"
+        self.app.sky_height_field.value = "15"
+        self.app._apply_and_save_parameters(ft.ControlEvent(name="on_click", control=None))
+        self.assertEqual(self.app.spectra_processor.spectrum_height, 7)
+        self.assertEqual(self.app.spectra_processor.sky_height, 15)
 
 
 if __name__ == "__main__":

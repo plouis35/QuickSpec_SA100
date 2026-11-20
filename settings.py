@@ -23,18 +23,39 @@ class ParamSpec:
     kind: type  # int, float ou str
     widget: str  # nom de l'attribut du contrôle dans l'application
     error_name: str  # nom utilisé dans les messages d'erreur
+    section: str = ""  # titre affiché au-dessus du champ quand la section change
+    strip: bool = True  # retire les espaces autour d'une saisie texte
 
 
 # Pour ajouter un paramètre : un champ dans AppParameters + une ligne ici (+ sa règle dans __post_init__).
 PARAM_SPECS: tuple[ParamSpec, ...] = (
-    ParamSpec("star_analyser", "Star Analyser", int, "star_analyser_radio", "Star Analyser"),
+    ParamSpec("star_analyser", "Star Analyser", int, "star_analyser_radio", "Star Analyser",
+              section="Réseau et optique"),
     ParamSpec("focal_mm", "Focal (mm)", int, "focal_field", "Focal"),
     ParamSpec("pixel_size_um", "Pixel_size (µm)", float, "pixel_size_field", "Pixel_size"),
-    ParamSpec("lambda_min", "lambda_min (Å)", int, "lambda_min_field", "lambda_min"),
+    ParamSpec("lambda_min", "lambda_min (Å)", int, "lambda_min_field", "lambda_min",
+              section="Fenêtre en longueur d’onde"),
     ParamSpec("lambda_max", "lambda_max (Å)", int, "lambda_max_field", "lambda_max"),
-    ParamSpec("line_size", "line_size", int, "line_size_field", "line_size"),
-    ParamSpec("line_type", "line_type (ls=...)", str, "line_type_field", "line_type"),
+    ParamSpec("spectrum_height", "Épaisseur de la bande du spectre (px)", int,
+              "spectrum_height_field", "spectrum_height", section="Extraction du spectre"),
+    ParamSpec("sky_height", "Épaisseur de la bande du fond de ciel (px)", int,
+              "sky_height_field", "sky_height"),
+    ParamSpec("calibration_dir", "Répertoire des masters (vide = dossier de l’image)", str,
+              "calibration_dir_field", "Répertoire des masters",
+              section="Corrections offset / dark / flat"),
+    ParamSpec("offset_name", "Master offset (nom, sans extension)", str,
+              "offset_name_field", "Master offset"),
+    ParamSpec("dark_name", "Master dark (nom, sans extension)", str,
+              "dark_name_field", "Master dark"),
+    ParamSpec("flat_name", "Master flat (nom, sans extension)", str,
+              "flat_name_field", "Master flat"),
+    ParamSpec("line_size", "line_size", int, "line_size_field", "line_size",
+              section="Affichage du spectre"),
+    ParamSpec("line_type", "line_type (ls=...)", str, "line_type_field", "line_type", strip=False),
 )
+
+# Paramètres dont la modification impose de recharger les images (corrections appliquées au chargement).
+CALIBRATION_FIELDS = ("calibration_dir", "offset_name", "dark_name", "flat_name")
 
 
 def _has_type(value: object, kind: type) -> bool:
@@ -57,6 +78,12 @@ class AppParameters:
     lambda_max: int = 7500
     line_size: int = 1
     line_type: str = "-"
+    spectrum_height: int = 10
+    sky_height: int = 20
+    calibration_dir: str = ""
+    offset_name: str = "master_offset"
+    dark_name: str = "master_dark"
+    flat_name: str = "master_flat"
 
     def __post_init__(self) -> None:
         """Rejette les types et valeurs invalides."""
@@ -76,6 +103,8 @@ class AppParameters:
             raise ValueError("lambda_max must be greater than lambda_min.")
         if self.line_size <= 0:
             raise ValueError("line_size must be an integer greater than zero.")
+        if self.spectrum_height <= 0 or self.sky_height <= 0:
+            raise ValueError("spectrum_height and sky_height must be integers greater than zero.")
         if self.line_type not in VALID_LINE_TYPES:
             raise ValueError("line_type must be a supported Matplotlib line style.")
 
@@ -109,7 +138,9 @@ class AppParameters:
         """
         kwargs = {}
         for spec in PARAM_SPECS:
-            text = (raw.get(spec.name) or "").strip() if spec.kind is not str else raw.get(spec.name, "")
+            text = raw.get(spec.name) or ""
+            if spec.strip:
+                text = text.strip()
             try:
                 kwargs[spec.name] = spec.kind(text)
             except (TypeError, ValueError, OverflowError) as exc:

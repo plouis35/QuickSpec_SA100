@@ -55,8 +55,8 @@ class Spectra:
         distance_mm: float = 35.0,
         pixel_size_um: float = 4.65,
         grating_period_nm: float = 5000.0,
-        half_height: int = 5,
-        sky_half_height: int = 10,
+        spectrum_height: int = 10,
+        sky_height: int = 20,
         lambda_min: float = 3500.0,
         lambda_max: float = 7500.0,
         order_zero_offset_px: int = 0,
@@ -67,8 +67,8 @@ class Spectra:
             distance_mm: Grating-to-sensor distance in millimeters.
             pixel_size_um: Sensor pixel size in micrometers.
             grating_period_nm: Grating period in nanometers.
-            half_height: Half-height of the spectrum extraction band in pixels.
-            sky_half_height: Half-height of the sky band in pixels.
+            spectrum_height: Thickness of the spectrum binning band in pixels.
+            sky_height: Thickness of the sky-background band in pixels.
             lambda_min: Inclusive lower bound of the wavelength window in Å.
             lambda_max: Exclusive upper bound of the wavelength window in Å.
             order_zero_offset_px: Pixel offset used as the wavelength origin.
@@ -79,8 +79,8 @@ class Spectra:
         self.distance_mm = float(distance_mm)
         self.pixel_size_um = float(pixel_size_um)
         self.grating_period_nm = float(grating_period_nm)
-        self.half_height = int(half_height)
-        self.sky_half_height = int(sky_half_height)
+        self.spectrum_height = int(spectrum_height)
+        self.sky_height = int(sky_height)
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
         self.order_zero_offset_px = int(order_zero_offset_px)
@@ -146,8 +146,8 @@ class Spectra:
             x0_rotated,
             y0_rotated,
             sky_y_rotated,
-            self.half_height,
-            self.sky_half_height,
+            self.spectrum_height,
+            self.sky_height,
         )
         if spectrum_strip.shape[0] == 0 or sky_strip.shape[0] == 0:
             raise ValueError("The spectrum or sky selection lies outside the image.")
@@ -192,8 +192,8 @@ class Spectra:
             sky_strip=sky_strip,
             angle_degrees=angle,
             dispersion_angstrom_per_pixel=dispersion,
-            spectrum_rows=strip_rows(height, y0_rotated, self.half_height),
-            sky_rows=strip_rows(height, sky_y_rotated, self.sky_half_height),
+            spectrum_rows=strip_rows(height, y0_rotated, self.spectrum_height),
+            sky_rows=strip_rows(height, sky_y_rotated, self.sky_height),
             x_start=int(round(x0_rotated)),
         )
         logger.info(
@@ -214,8 +214,8 @@ class Spectra:
             raise ValueError("Distance and pixel size must be positive.")
         if self.grating_period_nm <= 0:
             raise ValueError("Grating period must be positive.")
-        if self.half_height < 1 or self.sky_half_height < 1:
-            raise ValueError("Extraction strip half-heights must be positive.")
+        if self.spectrum_height < 1 or self.sky_height < 1:
+            raise ValueError("Extraction strip thicknesses must be positive.")
         if self.lambda_max <= self.lambda_min:
             raise ValueError("lambda_max must be greater than lambda_min.")
 
@@ -269,19 +269,19 @@ def rotate_point(
     )
 
 
-def strip_rows(height: int, center_y: float, half_height: int) -> tuple[int, int]:
+def strip_rows(height: int, center_y: float, thickness: int) -> tuple[int, int]:
     """Rows ``[low, high[`` of a horizontal band centred on ``center_y``, clipped to the image.
 
     Args:
         height: Image height in pixels.
         center_y: Vertical centre of the band.
-        half_height: Half-height of the band in pixels.
+        thickness: Band thickness in pixels (odd values are centred on a pixel row).
 
     Returns:
         The first row and the row after the last one.
     """
-    center = int(round(center_y))
-    return max(0, center - half_height), min(height, center + half_height)
+    low = int(round(center_y)) - thickness // 2
+    return max(0, low), min(height, low + thickness)
 
 
 def crop_spectrum(
@@ -289,8 +289,8 @@ def crop_spectrum(
     x0_rotated: float,
     y0_rotated: float,
     sky_y_rotated: float,
-    half_height: int,
-    sky_half_height: int,
+    spectrum_height: int,
+    sky_height: int,
 ) -> tuple[ImageArray, ImageArray]:
     """Extract the spectral and sky strips from a rectified image.
 
@@ -299,8 +299,8 @@ def crop_spectrum(
         x0_rotated: Horizontal start coordinate of the spectrum.
         y0_rotated: Vertical center of the spectral trace.
         sky_y_rotated: Vertical center of the sky-background band.
-        half_height: Half-height of the spectrum strip in pixels.
-        sky_half_height: Half-height of the sky strip in pixels.
+        spectrum_height: Thickness of the spectrum strip in pixels.
+        sky_height: Thickness of the sky strip in pixels.
 
     Returns:
         Copies of the spectrum strip and sky strip, respectively.
@@ -313,19 +313,17 @@ def crop_spectrum(
     if not 0 <= x_start < width:
         raise ValueError("The order-zero point is outside the image.")
 
-    spectrum_center = int(round(y0_rotated))
-    sky_center = int(round(sky_y_rotated))
-    spectrum_low, spectrum_high = strip_rows(height, y0_rotated, half_height)
-    sky_low, sky_high = strip_rows(height, sky_y_rotated, sky_half_height)
+    spectrum_low, spectrum_high = strip_rows(height, y0_rotated, spectrum_height)
+    sky_low, sky_high = strip_rows(height, sky_y_rotated, sky_height)
     logger.info(
-        "Bandes (image tournée) : spectre y=[%d, %d[ centré sur %d (±%d), "
-        "ciel y=[%d, %d[ centré sur %d (±%d), départ x=%d",
-        spectrum_low, spectrum_high, spectrum_center, half_height,
-        sky_low, sky_high, sky_center, sky_half_height, x_start,
+        "Bandes (image tournée) : spectre y=[%d, %d[ (épaisseur %d, centre %d), "
+        "ciel y=[%d, %d[ (épaisseur %d, centre %d), départ x=%d",
+        spectrum_low, spectrum_high, spectrum_height, round(y0_rotated),
+        sky_low, sky_high, sky_height, round(sky_y_rotated), x_start,
     )
-    if spectrum_high - spectrum_low < 2 * half_height:
+    if spectrum_high - spectrum_low < spectrum_height:
         logger.warning("Bande du spectre tronquée par le bord de l'image")
-    if sky_high - sky_low < 2 * sky_half_height:
+    if sky_high - sky_low < sky_height:
         logger.warning("Bande de ciel tronquée par le bord de l'image")
     if spectrum_low < sky_high and sky_low < spectrum_high:
         logger.warning("Les bandes spectre et ciel se chevauchent : le ciel contient du signal")

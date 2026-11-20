@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 import random
@@ -11,6 +12,7 @@ import flet as ft
 import numpy as np
 from numpy.typing import ArrayLike
 
+from calibration import load_masters
 from image_processing import Image
 from plotting import (  # noqa: F401  (certains noms sont ré-exportés pour les tests)
     DEFAULT_PLOT_SIZE,
@@ -29,6 +31,7 @@ from plotting import (  # noqa: F401  (certains noms sont ré-exportés pour les
     spectrum_png_data_uri,
 )
 from settings import (
+    CALIBRATION_FIELDS,
     PARAM_SPECS,
     AppParameters,
     load_parameters,
@@ -55,6 +58,7 @@ LOG_LEVEL_COLORS = {
 }
 APPLICATION_LOGGERS = (
     logger,
+    logging.getLogger("calibration"),
     logging.getLogger("image_io"),
     logging.getLogger("image_processing"),
     logging.getLogger("spectra_processing"),
@@ -63,6 +67,20 @@ APPLICATION_LOGGERS = (
 )
 BAND_COLORS = ("#ff2020", "#3b82f6")  # bande du spectre (rouge), bande de ciel (bleu)
 BAND_LINE_PX = 2.0
+SECTION_NOTES = {
+    "Réseau et optique": "La focale servira au calcul de la dispersion (étape à venir).",
+    "Extraction du spectre": (
+        "Épaisseur totale des bandes de binning, centrées sur la trace du spectre "
+        "et sur le point de fond de ciel."
+    ),
+    "Corrections offset / dark / flat": (
+        "Appliquées à chaque image au chargement (extensions cherchées : fits, fit, fts, png, "
+        "jpg, jpeg ; un nom vide désactive la correction ; si un master manque, un warning "
+        "apparaît dans Logs). Le dark doit déjà être débarrassé de l’offset, et le flat de "
+        "l’offset et du dark."
+    ),
+    "Affichage du spectre": "Styles Matplotlib : -, --, -., :, solid, dashed, dashdot, dotted",
+}
 SIZE_TOLERANCE_PX = 2.0  # variation de taille ignorée (évite de re-rendre pour rien)
 ImagePoint: TypeAlias = tuple[float, float]
 StageSize: TypeAlias = tuple[float, float]
@@ -218,7 +236,7 @@ class QuickSpecFletApp:
     def _build_image_tab(self) -> ft.Control:
         """Onglet Image : boutons, statut et visionneuse zoomable à taille mesurée."""
         self.image_status = ft.Text(
-            "Ouvre une image, puis sélectionne l’ordre zéro, le spectre et le ciel.", size=13
+            "Ouvre une ou plusieurs images, puis sélectionne l’ordre zéro, le spectre et le ciel.", size=13
         )
         # Le placeholder épouse la zone (left/top/right/bottom) : plus de taille figée.
         self.image_stack = ft.Stack(
@@ -352,7 +370,8 @@ class QuickSpecFletApp:
         )
 
     def _build_parameters_tab(self) -> ft.Control:
-        """Onglet Parameters : un contrôle par entrée de PARAM_SPECS."""
+        """Onglet Parameters : un contrôle par entrée de PARAM_SPECS, groupés par section."""
+        form_controls: list[ft.Control] = []
         for spec in PARAM_SPECS:
             value = getattr(self.parameters, spec.name)
             if spec.name == "star_analyser":
@@ -373,18 +392,21 @@ class QuickSpecFletApp:
                 )
             self.param_fields[spec.name] = control
             setattr(self, spec.widget, control)
+            if spec.section:
+                form_controls.append(ft.Text(spec.section, size=15, weight=ft.FontWeight.BOLD))
+                if spec.section in SECTION_NOTES:
+                    form_controls.append(
+                        ft.Text(SECTION_NOTES[spec.section], size=12, color=ft.Colors.WHITE_70)
+                    )
+            form_controls.append(control)
         self.parameter_status = ft.Text(self.parameter_load_error or "Valeurs prêtes à modifier.", size=13)
-        grey = ft.Colors.WHITE_70
         return ft.Column(
             expand=True,
             scroll=ft.ScrollMode.AUTO,
             spacing=12,
             controls=[
                 ft.Text("Parameters", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text("StarAnalyser — réseau", size=14),
-                *self.param_fields.values(),
-                ft.Text("Styles Matplotlib : -, --, -., :, solid, dashed, dashdot, dotted", size=12, color=grey),
-                ft.Text("Focal sera utilisée pour la calibration de l’étape 4.", size=12, color=grey),
+                *form_controls,
                 ft.Row(
                     wrap=True,
                     controls=[
@@ -410,6 +432,8 @@ class QuickSpecFletApp:
         sp.grating_period_nm = 1_000_000.0 / p.star_analyser
         sp.lambda_min = float(p.lambda_min)
         sp.lambda_max = float(p.lambda_max)
+        sp.spectrum_height = p.spectrum_height
+        sp.sky_height = p.sky_height
         self._log_calibration()
 
     def _log_calibration(self) -> None:
@@ -419,6 +443,9 @@ class QuickSpecFletApp:
             "Calibration : réseau %d traits/mm (période %.0f nm), pixel %.2f µm, "
             "fenêtre λ %d–%d Å",
             p.star_analyser, sp.grating_period_nm, p.pixel_size_um, p.lambda_min, p.lambda_max,
+        )
+        logger.info(
+            "Bandes de binning : spectre %d px, ciel %d px", p.spectrum_height, p.sky_height
         )
         logger.info(
             "Focale saisie : %d mm (non encore utilisée) ; distance réseau-capteur fixe : %.1f mm",
@@ -474,11 +501,15 @@ class QuickSpecFletApp:
         self.parameters = parameters
         self._configure_spectra_processor()
         self._set_parameter_status("Paramètres appliqués et enregistrés.")
-        if (
-            self.spectra_processor.result is not None
-            and self.image_processor.data is not None
-            and len(self.selection_points) == 3
-        ):
+        if self.image_processor.paths and any(name in changes for name in CALIBRATION_FIELDS):
+            logger.info("Masters modifiés : rechargement des images avec les nouvelles corrections")
+            try:
+                self._load_images(self.image_processor.paths, keep_selection=True)
+            except (OSError, ValueError, RuntimeError) as exc:
+                logger.exception("Rechargement des images impossible")
+                self._set_parameter_status(f"Paramètres enregistrés, mais rechargement impossible : {exc}")
+                return
+        if self.image_processor.data is not None and len(self.selection_points) == 3:
             logger.info("Recalcul du spectre courant avec les nouveaux paramètres")
             self._extract_spectrum(navigate_to_spectrum=False, replace_latest=True)
         else:
@@ -585,37 +616,58 @@ class QuickSpecFletApp:
     # ------------------------------------------------------------------ image
 
     async def _open_picker(self, _event: ft.ControlEvent) -> None:
-        """Ouvre le sélecteur de fichiers (dans le dernier répertoire) et charge l'image."""
-        logger.info("Sélecteur d'image ouvert dans %s", self.last_directory)
+        """Ouvre le sélecteur (une ou plusieurs images, dernier répertoire) et charge la sélection."""
+        logger.info("Sélecteur d'images ouvert dans %s", self.last_directory)
         try:
             selected = await self.picker.pick_files(
-                dialog_title="Choisir une image",
+                dialog_title="Choisir une ou plusieurs images",
                 initial_directory=self.last_directory,
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=IMAGE_EXTENSIONS + [e.upper() for e in IMAGE_EXTENSIONS],
-                allow_multiple=False,
+                allow_multiple=True,
             )
             if not selected:
-                logger.info("Sélection d'image annulée")
+                logger.info("Sélection d'images annulée")
                 return
-            if not selected[0].path:
+            if not all(file.path for file in selected):
                 raise ValueError("Le sélecteur n’a pas fourni de chemin de fichier.")
-            path = Path(selected[0].path)
-            self.last_directory = str(path.parent)
+            paths = [Path(file.path) for file in selected]
+            self.last_directory = str(paths[0].parent)
             self._save_last_directory()
-            self._load_image(path)
+            self._show_image_status(f"Chargement de {len(paths)} image(s)…")
+            # Lecture, corrections et recalage dans un thread : l'interface reste réactive.
+            data = await asyncio.to_thread(self._compute_stack, paths)
+            self._show_loaded(paths, data)
         except (OSError, ValueError, RuntimeError) as exc:
-            logger.exception("Ouverture de l'image impossible")
+            logger.exception("Ouverture des images impossible")
             self._show_image_status(f"Erreur d’ouverture : {exc}")
 
-    def _load_image(self, path: str | Path) -> None:
-        """Charge une image et réinitialise la sélection (les spectres tracés sont conservés)."""
-        path = Path(path)
-        logger.info("Chargement de %s", path)
-        data = self.image_processor.load([path])
+    def _compute_stack(self, paths: list[Path]) -> np.ndarray:
+        """Charge les masters, corrige chaque image, les recale sur la première et les additionne."""
+        p = self.parameters
+        directory = Path(p.calibration_dir) if p.calibration_dir else paths[0].parent
+        masters = load_masters(
+            directory, {"offset": p.offset_name, "dark": p.dark_name, "flat": p.flat_name}
+        )
+        return self.image_processor.load_stack(paths, **masters)
+
+    def _load_images(self, paths: list[str | Path], *, keep_selection: bool = False) -> None:
+        """Charge une ou plusieurs images (version synchrone de l'ouverture)."""
+        paths = [Path(path) for path in paths]
+        self._show_loaded(paths, self._compute_stack(paths), keep_selection=keep_selection)
+
+    def _show_loaded(
+        self, paths: list[Path], data: np.ndarray, *, keep_selection: bool = False
+    ) -> None:
+        """Affiche l'image obtenue ; réinitialise la sélection sauf ``keep_selection``.
+
+        Les spectres déjà tracés sont conservés.
+        """
+        count = len(paths)
         self.image_shape = data.shape
-        self.current_image_label = path.name
-        self.selection_points.clear()
+        self.current_image_label = paths[0].name + (f" (+{count - 1})" if count > 1 else "")
+        if not keep_selection:
+            self.selection_points.clear()
         self.selecting = False
         self.spectra_processor.result = None
         self._previews.clear()
@@ -626,8 +678,12 @@ class QuickSpecFletApp:
             "Image %d × %d px : min=%.1f médiane=%.1f max=%.1f",
             data.shape[1], data.shape[0], finite.min(), np.median(finite), finite.max(),
         )
+        applied = self.image_processor.applied_corrections
+        details = [f"{data.shape[1]} × {data.shape[0]} px", f"corrections : {', '.join(applied) or 'aucune'}"]
+        if count > 1:
+            details.insert(0, f"{count} images recalées et additionnées")
         self.spectrum_status.value = self._spectrum_summary()
-        self._show_image_status(f"{path.name} — {data.shape[1]} × {data.shape[0]} px")
+        self._show_image_status(f"{self.current_image_label} — " + " — ".join(details))
         self._refresh_image_controls(data)
         self._render_spectrum()
         if self.page is not None:

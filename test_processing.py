@@ -75,10 +75,12 @@ class ImageProcessingTests(unittest.TestCase):
 
         registered_sum = processor.register()
 
+        # le décalage est estimé à ~0,01 px près (fenêtre de Hann sur 32×32 px) ; sur un bord
+        # franc à 200 l'interpolation bilinéaire laisse donc jusqu'à ~4 d'écart (2 %)
         np.testing.assert_allclose(
             registered_sum,
             reference.astype(np.float32) * 2,
-            atol=1.5,
+            atol=5.0,
         )
 
 
@@ -90,8 +92,8 @@ class Sa100ProcessingTests(unittest.TestCase):
         image = np.full((100, 240), 2.0, dtype=np.float32)
         image[38:42, 50:] += 10.0
         processor = Spectra(
-            half_height=2,
-            sky_half_height=5,
+            spectrum_height=4,
+            sky_height=10,
             lambda_min=0,
             lambda_max=10000,
         )
@@ -115,8 +117,8 @@ class Sa100ProcessingTests(unittest.TestCase):
             center = round(40 + 0.25 * (x - 40))
             image[center - 2:center + 2, x] = 100
         processor = Spectra(
-            half_height=4,
-            sky_half_height=5,
+            spectrum_height=8,
+            sky_height=10,
             lambda_min=0,
             lambda_max=10000,
         )

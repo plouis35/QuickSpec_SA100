@@ -1,4 +1,4 @@
-"""Image calibration and registration using NumPy."""
+"""Calibration (offset, dark, flat), registration and stacking of images with NumPy/SciPy."""
 
 import logging
 from pathlib import Path
@@ -6,6 +6,8 @@ from typing import Iterable, Literal, TypeAlias
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy import fft as scipy_fft
+from scipy import ndimage
 
 from image_io import read_image
 
@@ -15,13 +17,19 @@ logger.setLevel(logging.INFO)
 ImageArray: TypeAlias = NDArray[np.float32]
 MasterFrame: TypeAlias = ArrayLike | str | Path
 CombineMode: TypeAlias = Literal["sum", "mean"]
+Shift: TypeAlias = tuple[float, float]  # (décalage vertical, décalage horizontal) en pixels
+
+# Rapport signal/bruit du pic de corrélation de phase, (pic - médiane) / écart-type, en
+# dessous duquel le recalage est jugé douteux. Mesuré : 5 à 8 pour des images sans rapport
+# (quelle que soit leur taille), 12 à 45 pour de vraies paires, même très bruitées.
+REGISTRATION_MIN_SNR = 10.0
 
 
 class Image:
-    """Load, calibrate, and register supported images using NumPy.
+    """Load, calibrate, register and stack supported images using NumPy and SciPy.
 
-    The processor retains both the original frames and their current combined
-    or reduced image so later processing steps can reuse them.
+    The processor retains the original frames and their current combined or
+    reduced image so later processing steps can reuse them.
     """
 
     def __init__(self) -> None:
@@ -30,11 +38,127 @@ class Image:
         self.frames: list[ImageArray] = []
         self.raw_data: ImageArray | None = None
         self.data: ImageArray | None = None
+        self.applied_corrections: list[str] = []  # masters réellement appliqués
+        self.registration_shifts: list[Shift] = []  # décalage de chaque image vs la première
+
+    def load_stack(
+        self,
+        paths: Iterable[str | Path],
+        offset: MasterFrame | None = None,
+        dark: MasterFrame | None = None,
+        flat: MasterFrame | None = None,
+        register: bool = True,
+    ) -> ImageArray:
+        """Load images, correct each one, align them on the first and sum them.
+
+        Each frame is corrected (offset, dark, flat) *before* the sum, then
+        registered on the first frame with sub-pixel phase correlation, so the
+        corrections are applied once per frame and not once to the sum.
+        Frames are processed one at a time to limit memory use.
+
+        Args:
+            paths: Paths to supported raster or FITS images; the first is the
+                registration reference.
+            offset: Optional master offset (2D array or image path).
+            dark: Optional master dark, already offset-subtracted.
+            flat: Optional master flat, already offset/dark-subtracted.
+            register: Align frames on the first one before summing.
+
+        Returns:
+            The summed, calibrated image as a two-dimensional float32 array.
+
+        Raises:
+            ValueError: If no path is given or the frames differ in shape.
+        """
+        paths = [str(path) for path in paths]
+        if not paths:
+            raise ValueError("Select at least one image.")
+        logger.info(
+            "Chargement de %d image(s) : %s", len(paths), ", ".join(Path(p).name for p in paths)
+        )
+
+        first = read_image(paths[0])
+        masters = self._usable_masters(first.shape, offset=offset, dark=dark, flat=flat)
+        self.applied_corrections = [name for name, value in masters.items() if value is not None]
+        skipped = [name for name, value in masters.items() if value is None]
+        logger.info(
+            "Corrections : %s ; non appliquées : %s",
+            ", ".join(self.applied_corrections) or "aucune",
+            ", ".join(skipped) or "aucune",
+        )
+        flat_fit = _normalized_flat(masters["flat"]) if masters["flat"] is not None else None
+
+        total = np.zeros(first.shape, dtype=np.float32)
+        reference: ImageArray | None = None
+        self.registration_shifts = [(0.0, 0.0)]
+        for index, path in enumerate(paths):
+            frame = first if index == 0 else read_image(path)
+            if frame.shape != first.shape:
+                raise ValueError(
+                    f"{Path(path).name} : {frame.shape[1]} × {frame.shape[0]} px, "
+                    f"attendu {first.shape[1]} × {first.shape[0]} (comme la première image)."
+                )
+            frame = _sanitize(calibrate_frame(frame, masters["offset"], masters["dark"], flat_fit))
+            logger.info(
+                "Image %d/%d %s : médiane=%.1f max=%.1f après correction",
+                index + 1, len(paths), Path(path).name, float(np.median(frame)), float(frame.max()),
+            )
+            if index == 0:
+                reference = frame
+            elif register:
+                dy, dx, snr = _phase_correlation_shift(reference, frame)
+                logger.info(
+                    "Recalage de %s sur la première image : dy=%+.2f dx=%+.2f px (pic à %.0f σ)",
+                    Path(path).name, dy, dx, snr,
+                )
+                if snr < REGISTRATION_MIN_SNR:
+                    logger.warning(
+                        "Recalage de %s peu fiable (pic à %.1f σ < %.0f σ) : images trop différentes ?",
+                        Path(path).name, snr, REGISTRATION_MIN_SNR,
+                    )
+                self.registration_shifts.append((dy, dx))
+                frame = _shift_image(frame, (dy, dx))
+            else:
+                self.registration_shifts.append((0.0, 0.0))
+            total += frame
+
+        self.paths = paths
+        self.frames = []
+        self.raw_data = total
+        self.data = total.copy()
+        logger.info(
+            "Somme de %d image(s) %s : médiane=%.1f max=%.1f",
+            len(paths), "recalées" if register and len(paths) > 1 else "",
+            float(np.median(total)), float(total.max()),
+        )
+        return self.data.copy()
+
+    def _usable_masters(
+        self, shape: tuple[int, int], **masters: MasterFrame | None
+    ) -> dict[str, ImageArray | None]:
+        """Validate masters against the frame shape; unusable ones become ``None`` with a warning."""
+        usable: dict[str, ImageArray | None] = {}
+        for name, master in masters.items():
+            if master is None:
+                usable[name] = None
+                continue
+            array = read_image(master) if isinstance(master, (str, Path)) else np.asarray(master, np.float32)
+            if array.ndim != 2 or array.shape != shape:
+                logger.warning(
+                    "Master %s ignoré : %s au lieu de %d × %d "
+                    "(format différent ? JPEG/TIFF sont binnés 2×2 à la lecture)",
+                    name, "dimensions " + " × ".join(str(n) for n in reversed(array.shape)),
+                    shape[1], shape[0],
+                )
+                usable[name] = None
+            else:
+                usable[name] = array
+        return usable
 
     def load(
         self, paths: Iterable[str | Path], combine: CombineMode = "sum"
     ) -> ImageArray:
-        """Load equal-sized images and combine them by sum or mean.
+        """Load equal-sized images and combine them by sum or mean (no calibration).
 
         Args:
             paths: Paths to supported raster or FITS images.
@@ -67,10 +191,9 @@ class Image:
         self.paths = paths
         self.frames = frames
         self.raw_data = combined
-        result = combined.copy()
-        self.data = result
-        logger.info("Loaded %d image(s), shape=%s", len(frames), shape)
-        return result
+        self.data = combined.copy()
+        logger.info("Chargé %d image(s), forme=%s", len(frames), shape)
+        return combined.copy()
 
     def reduce(
         self,
@@ -79,6 +202,9 @@ class Image:
         flat: MasterFrame | None = None,
     ) -> ImageArray:
         """Apply optional offset and dark subtraction and flat-field correction.
+
+        This works on the combined image: for several frames, prefer
+        :meth:`load_stack`, which corrects each frame before summing.
 
         Args:
             offset: Optional master offset image or 2D pixel array.
@@ -95,24 +221,14 @@ class Image:
         if self.raw_data is None:
             raise RuntimeError("Load at least one image before reducing.")
 
-        reduced = self.raw_data.copy()
-        if offset is not None:
-            reduced -= self._master_array(offset, "offset")
-        if dark is not None:
-            reduced -= self._master_array(dark, "dark")
-        if flat is not None:
-            flat_data = self._master_array(flat, "flat")
-            valid = np.isfinite(flat_data) & (flat_data != 0)
-            if not np.any(valid):
-                raise ValueError("Flat field contains no finite non-zero pixels.")
-            normalized_flat = np.zeros_like(flat_data, dtype=np.float32)
-            normalized_flat[valid] = flat_data[valid] / np.median(flat_data[valid])
-            corrected = np.zeros_like(reduced, dtype=np.float32)
-            np.divide(reduced, normalized_flat, out=corrected, where=valid)
-            reduced = corrected
-
+        arrays = {
+            name: None if master is None else self._master_array(master, name)
+            for name, master in (("offset", offset), ("dark", dark), ("flat", flat))
+        }
+        flat_fit = _normalized_flat(arrays["flat"]) if arrays["flat"] is not None else None
+        reduced = calibrate_frame(self.raw_data, arrays["offset"], arrays["dark"], flat_fit)
         self.data = reduced
-        logger.info("Image reduction complete")
+        logger.info("Réduction de l'image terminée")
         return reduced
 
     def register(self, reference_index: int = 0) -> ImageArray:
@@ -142,16 +258,15 @@ class Image:
             if index == reference_index:
                 registered.append(frame.copy())
                 continue
-            shift = _phase_correlation_shift(reference, frame)
-            logger.info("Registering frame %d with shift %s", index, shift)
-            registered.append(_shift_image(frame, shift))
+            dy, dx, snr = _phase_correlation_shift(reference, frame)
+            logger.info("Recalage de l'image %d : dy=%+.2f dx=%+.2f px (pic à %.0f σ)", index, dy, dx, snr)
+            registered.append(_shift_image(frame, (dy, dx)))
 
         self.frames = registered
         result = np.sum(registered, axis=0, dtype=np.float32)
         self.raw_data = result
-        registered_sum = result.copy()
-        self.data = registered_sum
-        return registered_sum
+        self.data = result.copy()
+        return result.copy()
 
     def _master_array(self, master: MasterFrame, name: str) -> ImageArray:
         """Load or validate a calibration frame against the source dimensions.
@@ -169,65 +284,100 @@ class Image:
             array = np.asarray(master, dtype=np.float32)
         if array.ndim != 2 or not array.size:
             raise ValueError(f"The {name} frame must be a non-empty 2D array.")
-        return self._validated_shape(array, name)
-
-    def _validated_shape(self, array: ImageArray, name: str) -> ImageArray:
-        """Ensure a calibration array matches the loaded science image.
-
-        Args:
-            array: Calibration data to validate.
-            name: Calibration type used in error messages.
-
-        Returns:
-            The unchanged array after its dimensions have been validated.
-
-        Raises:
-            RuntimeError: If no science image has been loaded.
-            ValueError: If the calibration dimensions differ from the science
-                image dimensions.
-        """
-        if self.raw_data is None:
-            raise RuntimeError("Load an image before validating calibration frames.")
         if array.shape != self.raw_data.shape:
             raise ValueError(
-                f"The {name} frame has shape {array.shape}; "
-                f"expected {self.raw_data.shape}."
+                f"The {name} frame has shape {array.shape}; expected {self.raw_data.shape}."
             )
         return array
 
 
-def _phase_correlation_shift(
-    reference: ImageArray, moving: ImageArray
-) -> tuple[float, float]:
-    """Estimate the subpixel translation that aligns a frame to a reference.
+def _normalized_flat(flat: ImageArray) -> tuple[ImageArray, NDArray[np.bool_]]:
+    """Flat divided by its median, and the mask of its usable (finite, non-zero) pixels.
+
+    Raises:
+        ValueError: If the flat has no finite non-zero pixel.
+    """
+    valid = np.isfinite(flat) & (flat != 0)
+    if not np.any(valid):
+        raise ValueError("Flat field contains no finite non-zero pixels.")
+    normalized = np.zeros_like(flat, dtype=np.float32)
+    normalized[valid] = flat[valid] / np.median(flat[valid])
+    return normalized, valid
+
+
+def calibrate_frame(
+    frame: ImageArray,
+    offset: ImageArray | None = None,
+    dark: ImageArray | None = None,
+    flat: tuple[ImageArray, NDArray[np.bool_]] | None = None,
+) -> ImageArray:
+    """Return ``(frame - offset - dark) / flat``; pixels with an unusable flat become 0.
 
     Args:
-        reference: Reference image used for phase correlation.
-        moving: Image whose translation is being measured.
+        frame: Raw 2D image (not modified).
+        offset: Master offset, same shape as ``frame``.
+        dark: Master dark, same shape, already offset-subtracted.
+        flat: Output of :func:`_normalized_flat` for the master flat.
+    """
+    corrected = frame.astype(np.float32, copy=True)
+    if offset is not None:
+        corrected -= offset
+    if dark is not None:
+        corrected -= dark
+    if flat is not None:
+        normalized, valid = flat
+        result = np.zeros_like(corrected)
+        np.divide(corrected, normalized, out=result, where=valid)
+        corrected = result
+    return corrected
+
+
+def _sanitize(frame: ImageArray) -> ImageArray:
+    """Replace NaN/inf by 0 (they would corrupt the FFT and the sum) and warn once."""
+    bad = ~np.isfinite(frame)
+    count = int(np.count_nonzero(bad))
+    if count:
+        logger.warning("%d pixel(s) non finis remplacés par 0", count)
+        frame = np.where(bad, np.float32(0), frame)
+    return frame
+
+
+def _phase_correlation_shift(
+    reference: ImageArray, moving: ImageArray
+) -> tuple[float, float, float]:
+    """Estimate the translation that aligns ``moving`` on ``reference`` (sub-pixel).
+
+    The mean level is removed and a Hann window applied, so the image borders and
+    the sky background do not dominate the correlation.
+
+    Args:
+        reference: Reference image.
+        moving: Image whose translation is measured.
 
     Returns:
-        The vertical and horizontal shifts, in pixels, to apply to ``moving``.
+        ``(dy, dx, snr)``: the vertical and horizontal shifts, in pixels, to apply
+        to ``moving``, and the signal-to-noise ratio of the correlation peak.
     """
-    reference_fft = np.fft.fftn(reference)
-    moving_fft = np.fft.fftn(moving)
-    cross_power = reference_fft * moving_fft.conj()
+    window = np.outer(np.hanning(reference.shape[0]), np.hanning(reference.shape[1])).astype(np.float32)
+
+    def prepare(image: ImageArray) -> ImageArray:
+        image = np.nan_to_num(image.astype(np.float32, copy=False))
+        return (image - np.median(image)) * window
+
+    cross_power = scipy_fft.rfft2(prepare(reference)) * np.conj(scipy_fft.rfft2(prepare(moving)))
     magnitude = np.abs(cross_power)
     cross_power = np.divide(
-        cross_power,
-        magnitude,
-        out=np.zeros_like(cross_power),
-        where=magnitude > np.finfo(np.float32).eps,
+        cross_power, magnitude,
+        out=np.zeros_like(cross_power), where=magnitude > np.finfo(np.float32).eps,
     )
-    correlation = np.fft.ifftn(cross_power).real
+    correlation = scipy_fft.irfft2(cross_power, s=reference.shape)
     peak = np.array(np.unravel_index(np.argmax(correlation), correlation.shape))
     shifts = peak.astype(np.float64)
 
     for axis, axis_size in enumerate(reference.shape):
         if shifts[axis] > axis_size // 2:
             shifts[axis] -= axis_size
-
-        before_index = peak.copy()
-        after_index = peak.copy()
+        before_index, after_index = peak.copy(), peak.copy()
         before_index[axis] = (peak[axis] - 1) % axis_size
         after_index[axis] = (peak[axis] + 1) % axis_size
         before = correlation[tuple(before_index)]
@@ -237,34 +387,13 @@ def _phase_correlation_shift(
         if denominator != 0:
             shifts[axis] += 0.5 * (before - after) / denominator
 
-    return float(shifts[0]), float(shifts[1])
+    snr = (correlation[tuple(peak)] - np.median(correlation)) / max(float(correlation.std()), 1e-30)
+    return float(shifts[0]), float(shifts[1]), float(snr)
 
 
-def _shift_image(
-    image: ImageArray,
-    shift: tuple[float, float],
-    block_rows: int = 64,
-) -> ImageArray:
-    """Translate an image using bilinear interpolation and zero fill.
-
-    Args:
-        image: Two-dimensional source image.
-        shift: Vertical and horizontal shifts to apply, in pixels.
-        block_rows: Number of output rows sampled in each processing block.
-
-    Returns:
-        A translated image with the same shape as the input.
-    """
-    height, width = image.shape
-    source_x = np.arange(width, dtype=np.float32)[None, :] - shift[1]
-    output = np.zeros_like(image, dtype=np.float32)
-    for row_start in range(0, height, block_rows):
-        row_end = min(row_start + block_rows, height)
-        source_y = (
-            np.arange(row_start, row_end, dtype=np.float32)[:, None] - shift[0]
-        )
-        output[row_start:row_end] = _bilinear_sample(image, source_x, source_y)
-    return output
+def _shift_image(image: ImageArray, shift: Shift) -> ImageArray:
+    """Translate an image by ``(dy, dx)`` pixels (bilinear interpolation, zero fill)."""
+    return ndimage.shift(image, shift, order=1, mode="constant", cval=0.0)
 
 
 def _bilinear_sample(
