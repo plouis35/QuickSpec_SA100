@@ -43,7 +43,7 @@ from settings import (
     save_parameters,
     write_last_directory,
 )
-from spectra_processing import Spectra
+from spectra_processing import Spectra, refine_centroid
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -72,7 +72,11 @@ APPLICATION_LOGGERS = (
 BAND_COLORS = ("#ff2020", "#3b82f6")  # bande du spectre (rouge), bande de ciel (bleu)
 BAND_LINE_PX = 2.0
 SECTION_NOTES = {
-    "Réseau et optique": "La focale servira au calcul de la dispersion (étape à venir).",
+    "Réseau et optique": (
+        "Réseau devant l’objectif : λ = d·sin(atan(x/f)), x = distance à l’ordre zéro. "
+        "La taille de pixel est celle du capteur natif ; le binning 2×2 des JPEG/TIFF couleur "
+        "est pris en compte automatiquement."
+    ),
     "Extraction du spectre": (
         "Épaisseur totale des bandes de binning, centrées sur la trace du spectre "
         "et sur le point de fond de ciel."
@@ -452,6 +456,8 @@ class QuickSpecFletApp:
         """Applique les paramètres optiques au processeur de spectres."""
         p, sp = self.parameters, self.spectra_processor
         sp.pixel_size_um = p.pixel_size_um
+        sp.focal_mm = float(p.focal_mm)
+        sp.binning = self.image_processor.binning
         sp.grating_period_nm = 1_000_000.0 / p.star_analyser
         sp.lambda_min = float(p.lambda_min)
         sp.lambda_max = float(p.lambda_max)
@@ -463,17 +469,15 @@ class QuickSpecFletApp:
         """Trace les paramètres de calibration actifs."""
         p, sp = self.parameters, self.spectra_processor
         logger.info(
-            "Calibration : réseau %d traits/mm (période %.0f nm), pixel %.2f µm, "
-            "fenêtre λ %d–%d Å",
-            p.star_analyser, sp.grating_period_nm, p.pixel_size_um, p.lambda_min, p.lambda_max,
+            "Calibration : réseau %d traits/mm (période %.0f nm), focale %d mm, pixel natif "
+            "%.2f µm × binning %d = %.2f µm, fenêtre λ %d–%d Å",
+            p.star_analyser, sp.grating_period_nm, p.focal_mm, p.pixel_size_um, sp.binning,
+            p.pixel_size_um * sp.binning, p.lambda_min, p.lambda_max,
         )
         logger.info(
             "Bandes de binning : spectre %d px, ciel %d px", p.spectrum_height, p.sky_height
         )
-        logger.info(
-            "Focale saisie : %d mm (non encore utilisée) ; distance réseau-capteur fixe : %.1f mm",
-            p.focal_mm, sp.distance_mm,
-        )
+        logger.info("Affinage de l'ordre zéro : rayon %d px", p.centroid_radius)
 
     def _read_parameters_from_controls(self) -> AppParameters:
         """Lit et valide le formulaire.
@@ -693,6 +697,7 @@ class QuickSpecFletApp:
             self.selection_points.clear()
         self.selecting = False
         self.spectra_processor.result = None
+        self._configure_spectra_processor()  # le binning dépend de l'image chargée
         self._previews.clear()
         self._cut_source = None  # nouvel échantillon pour les curseurs
         if not keep_selection:
@@ -895,6 +900,10 @@ class QuickSpecFletApp:
         if point is None:
             logger.debug("Clic hors de l'image ignoré : %s", event.local_position)
             return
+        if not self.selection_points:
+            point = refine_centroid(
+                self.image_processor.data, *point, self.parameters.centroid_radius
+            )
         self.selection_points.append(point)
         logger.info(
             "Point %d/3 (%s) : x=%.1f y=%.1f px",

@@ -9,7 +9,7 @@ from numpy.typing import ArrayLike, NDArray
 from scipy import fft as scipy_fft
 from scipy import ndimage
 
-from image_io import read_image
+from image_io import read_image, read_image_binned
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -40,6 +40,7 @@ class Image:
         self.data: ImageArray | None = None
         self.applied_corrections: list[str] = []  # masters réellement appliqués
         self.registration_shifts: list[Shift] = []  # décalage de chaque image vs la première
+        self.binning: int = 1  # 2 si les pixels ont été sommés 2×2 à la lecture (JPEG, couleur)
 
     def load_stack(
         self,
@@ -77,7 +78,9 @@ class Image:
             "Chargement de %d image(s) : %s", len(paths), ", ".join(Path(p).name for p in paths)
         )
 
-        first = read_image(paths[0])
+        first, self.binning = read_image_binned(paths[0])
+        if self.binning > 1:
+            logger.info("Pixels sommés %d×%d à la lecture (JPEG/couleur)", self.binning, self.binning)
         masters = self._usable_masters(first.shape, offset=offset, dark=dark, flat=flat)
         self.applied_corrections = [name for name, value in masters.items() if value is not None]
         skipped = [name for name, value in masters.items() if value is None]

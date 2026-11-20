@@ -1,4 +1,4 @@
-"""SA100 geometry, extraction and wavelength calibration."""
+"""Star Analyser (SA100/SA200) geometry, extraction and wavelength calibration."""
 
 from dataclasses import dataclass
 import logging
@@ -52,9 +52,10 @@ class Spectra:
 
     def __init__(
         self,
-        distance_mm: float = 35.0,
+        focal_mm: float = 50.0,
         pixel_size_um: float = 4.65,
         grating_period_nm: float = 5000.0,
+        binning: int = 1,
         spectrum_height: int = 10,
         sky_height: int = 20,
         lambda_min: float = 3500.0,
@@ -63,10 +64,15 @@ class Spectra:
     ) -> None:
         """Configure the optical geometry and extraction band widths.
 
+        The grating sits in front of the lens, so the grating-to-sensor distance is the
+        focal length. Wavelengths follow ``λ = d · sin(atan(x / f))`` where ``x`` is the
+        distance to the zero order on the sensor.
+
         Args:
-            distance_mm: Grating-to-sensor distance in millimeters.
-            pixel_size_um: Sensor pixel size in micrometers.
-            grating_period_nm: Grating period in nanometers.
+            focal_mm: Focal length of the lens in millimeters.
+            pixel_size_um: Native sensor pixel pitch in micrometers.
+            grating_period_nm: Grating period in nanometers (1e6 / lines per mm).
+            binning: Sensor pixels per image pixel along each axis (2 for 2x2-binned images).
             spectrum_height: Thickness of the spectrum binning band in pixels.
             sky_height: Thickness of the sky-background band in pixels.
             lambda_min: Inclusive lower bound of the wavelength window in Å.
@@ -76,9 +82,10 @@ class Spectra:
         Raises:
             ValueError: If an optical setting or wavelength range is invalid.
         """
-        self.distance_mm = float(distance_mm)
+        self.focal_mm = float(focal_mm)
         self.pixel_size_um = float(pixel_size_um)
         self.grating_period_nm = float(grating_period_nm)
+        self.binning = int(binning)
         self.spectrum_height = int(spectrum_height)
         self.sky_height = int(sky_height)
         self.lambda_min = float(lambda_min)
@@ -164,14 +171,12 @@ class Spectra:
             int(np.count_nonzero(raw_flux < 0)), float(flux.max()), float(np.median(flux)),
         )
 
-        dispersion = compute_dispersion(
-            self.distance_mm,
-            self.pixel_size_um,
-            self.grating_period_nm,
+        x_start = int(round(x0_rotated))
+        # Distance de chaque colonne à l'ordre zéro (sous-pixel : le centroïde n'est pas entier).
+        offsets = x_start + np.arange(flux.size, dtype=np.float64) - x0_rotated - self.order_zero_offset_px
+        wavelengths = star_analyser_wavelengths(
+            offsets, self.grating_period_nm, self.focal_mm, self.pixel_size_um * self.binning
         )
-        wavelengths = (
-            np.arange(flux.size, dtype=np.float64) - self.order_zero_offset_px
-        ) * dispersion
         keep = (wavelengths > self.lambda_min) & (wavelengths < self.lambda_max)
         logger.info(
             "Fenêtre λ ]%.0f, %.0f[ Å : %d pixel(s) conservé(s) sur %d (λ calculées %.0f à %.0f Å)",
@@ -184,8 +189,10 @@ class Spectra:
                 "check the SA100 parameters and image."
             )
 
+        kept = wavelengths[keep]
+        dispersion = float((kept[-1] - kept[0]) / max(kept.size - 1, 1))
         self.result = SpectrumResult(
-            wavelengths=wavelengths[keep],
+            wavelengths=kept,
             flux=flux[keep].astype(np.float32),
             rectified_image=rectified,
             spectrum_strip=spectrum_strip,
@@ -194,7 +201,7 @@ class Spectra:
             dispersion_angstrom_per_pixel=dispersion,
             spectrum_rows=strip_rows(height, y0_rotated, self.spectrum_height),
             sky_rows=strip_rows(height, sky_y_rotated, self.sky_height),
-            x_start=int(round(x0_rotated)),
+            x_start=x_start,
         )
         logger.info(
             "Spectre extrait : %d échantillons, %.3f Å/px, λ %.0f–%.0f Å",
@@ -210,8 +217,10 @@ class Spectra:
             ValueError: If any setting is non-positive or the wavelength range
                 is empty or reversed.
         """
-        if self.distance_mm <= 0 or self.pixel_size_um <= 0:
-            raise ValueError("Distance and pixel size must be positive.")
+        if self.focal_mm <= 0 or self.pixel_size_um <= 0:
+            raise ValueError("Focal length and pixel size must be positive.")
+        if self.binning < 1:
+            raise ValueError("Binning must be at least 1.")
         if self.grating_period_nm <= 0:
             raise ValueError("Grating period must be positive.")
         if self.spectrum_height < 1 or self.sky_height < 1:
@@ -334,40 +343,103 @@ def crop_spectrum(
     )
 
 
-def compute_dispersion(
-    distance_mm: float,
-    pixel_size_um: float,
-    grating_period_nm: float = 5000.0,
-) -> float:
-    """Calculate the linear SA100 wavelength dispersion.
+def star_analyser_wavelengths(
+    offsets_px: ArrayLike,
+    grating_period_nm: float,
+    focal_mm: float,
+    pixel_pitch_um: float,
+) -> NDArray[np.float64]:
+    """Wavelengths (Å) at given pixel distances from the zero order.
+
+    ``λ = d · sin(atan(x / f))`` with ``x = offset · pixel pitch``: exact for a grating in
+    front of a lens (no linear approximation). Negative offsets give negative wavelengths.
 
     Args:
-        distance_mm: Grating-to-sensor distance in millimeters.
-        pixel_size_um: Sensor pixel size in micrometers.
-        grating_period_nm: Grating period in nanometers.
+        offsets_px: Distances to the zero order, in image pixels.
+        grating_period_nm: Grating period ``d`` in nanometers.
+        focal_mm: Focal length ``f`` in millimeters.
+        pixel_pitch_um: Size of one *image* pixel in micrometers (native pitch × binning).
 
     Returns:
-        Linear wavelength dispersion in Angstroms per pixel.
+        Wavelengths in Angstroms.
 
     Raises:
-        ValueError: If geometry values are not positive or the grating period
-            cannot diffract the reference wavelength.
+        ValueError: If a geometry value is not positive.
     """
-    if distance_mm <= 0 or pixel_size_um <= 0 or grating_period_nm <= 0:
-        raise ValueError("Distance, pixel size and grating period must be positive.")
-    sin_theta = 550.0 / grating_period_nm
-    if not 0 < sin_theta < 1:
-        raise ValueError("Grating period must be greater than 550 nm.")
-    cos_theta = math.sqrt(1.0 - sin_theta**2)
-    dispersion = (
-        grating_period_nm * cos_theta * (pixel_size_um / 1000.0) / distance_mm * 10.0
-    )
+    if grating_period_nm <= 0 or focal_mm <= 0 or pixel_pitch_um <= 0:
+        raise ValueError("Grating period, focal length and pixel pitch must be positive.")
+    x_mm = np.asarray(offsets_px, dtype=np.float64) * (pixel_pitch_um / 1000.0)
+    wavelengths = grating_period_nm * np.sin(np.arctan2(x_mm, focal_mm)) * 10.0
     logger.info(
-        "Dispersion : période %.0f nm, pixel %.2f µm, distance %.1f mm, "
-        "cosθ(550 nm)=%.4f → %.3f Å/px",
-        grating_period_nm, pixel_size_um, distance_mm, cos_theta, dispersion,
+        "Calibration : d=%.0f nm, f=%.1f mm, pixel image %.2f µm → %.3f Å/px à l'origine, "
+        "%.3f Å/px au bout (λ %.0f–%.0f Å)",
+        grating_period_nm, focal_mm, pixel_pitch_um,
+        grating_period_nm * (pixel_pitch_um / 1000.0) / focal_mm * 10.0,
+        float(np.mean(np.diff(wavelengths))) if wavelengths.size > 1 else 0.0,
+        float(wavelengths.min(initial=0.0)), float(wavelengths.max(initial=0.0)),
     )
-    return dispersion
+    return wavelengths
+
+
+def refine_centroid(
+    image: ImageArray, x: float, y: float, radius: int, iterations: int = 6
+) -> tuple[float, float]:
+    """Refine a clicked position to the intensity-weighted centroid of the star around it.
+
+    The window (``2·radius+1`` pixels wide) is re-centred on the centroid at each iteration.
+    The local background is the window median, and only pixels clearly above it
+    (3 robust σ) contribute, so noise does not pull the result toward the window centre.
+
+    Args:
+        image: 2D image.
+        x: Clicked horizontal position (pixels).
+        y: Clicked vertical position (pixels).
+        radius: Half-size of the search window; 0 disables the refinement.
+        iterations: Maximum number of re-centring steps.
+
+    Returns:
+        The refined ``(x, y)``, or the input position if there is no usable signal.
+    """
+    if radius <= 0:
+        logger.debug("Affinage du centroïde désactivé (rayon 0)")
+        return x, y
+    height, width = image.shape
+    cx, cy = x, y
+    for step in range(iterations):
+        x_low, x_high = max(0, int(round(cx)) - radius), min(width, int(round(cx)) + radius + 1)
+        y_low, y_high = max(0, int(round(cy)) - radius), min(height, int(round(cy)) + radius + 1)
+        window = image[y_low:y_high, x_low:x_high].astype(np.float64)
+        if window.size == 0 or not np.isfinite(window).all():
+            logger.warning("Affinage impossible en (%.1f, %.1f) : fenêtre vide ou non finie", x, y)
+            return x, y
+        background = float(np.median(window))
+        sigma = 1.4826 * float(np.median(np.abs(window - background)))
+        weights = np.where(window > background + 3.0 * sigma, window - background, 0.0)
+        total = float(weights.sum())
+        if total <= 0:
+            logger.warning(
+                "Affinage impossible en (%.1f, %.1f) : aucun signal au-dessus du fond "
+                "dans une fenêtre de ±%d px", x, y, radius,
+            )
+            return x, y
+        ys, xs = np.mgrid[y_low:y_high, x_low:x_high]
+        new_x, new_y = float((weights * xs).sum() / total), float((weights * ys).sum() / total)
+        moved = math.hypot(new_x - cx, new_y - cy)
+        cx, cy = new_x, new_y
+        if moved < 0.01:
+            break
+    shift = math.hypot(cx - x, cy - y)
+    logger.info(
+        "Ordre zéro affiné au centroïde : clic (%.1f, %.1f) → (%.2f, %.2f), décalage %.2f px "
+        "(fenêtre ±%d px, %d itération(s))",
+        x, y, cx, cy, shift, radius, step + 1,
+    )
+    if shift > 0.75 * radius:
+        logger.warning(
+            "L'ordre zéro a été déplacé de %.1f px (> 75 %% du rayon %d) : étoile mal centrée sur le clic ?",
+            shift, radius,
+        )
+    return cx, cy
 
 
 def _rotate_image(

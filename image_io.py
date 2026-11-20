@@ -44,6 +44,18 @@ def read_image(path: ImagePath) -> ImageArray:
         FileNotFoundError: If the input path does not exist.
         ValueError: If the extension or file contents are unsupported.
     """
+    return read_image_binned(path)[0]
+
+
+def read_image_binned(path: ImagePath) -> tuple[ImageArray, int]:
+    """Like :func:`read_image`, also returning the binning applied while reading.
+
+    JPEG and color TIFF/PNG-derived luminance are summed in 2x2 blocks, so one image pixel
+    then covers 2 sensor pixels: the wavelength calibration needs this factor.
+
+    Returns:
+        ``(pixels, binning)`` where ``binning`` is 1 (no binning) or 2 (2x2 blocks).
+    """
     image_path = Path(path)
     if not image_path.is_file():
         raise FileNotFoundError(f"Image file not found: {image_path}")
@@ -53,11 +65,11 @@ def read_image(path: ImagePath) -> ImageArray:
         stem_extension = Path(image_path.stem).suffix.lower()
         if stem_extension not in FITS_EXTENSIONS:
             raise ValueError(f"Unsupported compressed image format: {image_path}")
-        return read_fits(image_path, compressed=True)
+        return read_fits(image_path, compressed=True), 1
 
     extension = image_path.suffix.lower()
     if extension in FITS_EXTENSIONS:
-        return read_fits(image_path)
+        return read_fits(image_path), 1
     if extension not in RASTER_EXTENSIONS:
         raise ValueError(f"Unsupported image format: {image_path.suffix or image_path}")
     return _read_raster(image_path, bin_color=extension in COLOR_BIN_EXTENSIONS)
@@ -137,7 +149,7 @@ def read_fits(path: ImagePath, compressed: bool = False) -> ImageArray:
     return image
 
 
-def _read_raster(path: Path, bin_color: bool) -> ImageArray:
+def _read_raster(path: Path, bin_color: bool) -> tuple[ImageArray, int]:
     """Read a Pillow-supported raster image and convert it to grayscale.
 
     Args:
@@ -145,7 +157,7 @@ def _read_raster(path: Path, bin_color: bool) -> ImageArray:
         bin_color: Whether color pixel values should be summed in 2x2 blocks.
 
     Returns:
-        A two-dimensional float32 grayscale array.
+        A two-dimensional float32 grayscale array and the binning factor (1 or 2).
     """
     try:
         with PillowImage.open(path) as source:
@@ -174,7 +186,7 @@ def _read_raster(path: Path, bin_color: bool) -> ImageArray:
 
     if pixels.ndim != 2 or not pixels.size:
         raise ValueError(f"Image must contain a non-empty 2D array: {path}")
-    return np.asarray(pixels, dtype=np.float32)
+    return np.asarray(pixels, dtype=np.float32), 2 if bin_pixels else 1
 
 
 def _bin_2x2(pixels: NDArray, path: Path) -> NDArray[np.float64]:

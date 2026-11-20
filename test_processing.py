@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image as PillowImage
 
 from image_processing import Image
-from spectra_processing import Spectra, compute_dispersion
+from spectra_processing import Spectra, star_analyser_wavelengths
 
 
 class ImageProcessingTests(unittest.TestCase):
@@ -148,7 +148,7 @@ class Sa100ProcessingTests(unittest.TestCase):
 
     def test_dispersion_is_positive(self) -> None:
         """Ensure valid optical settings produce positive dispersion."""
-        self.assertGreater(compute_dispersion(35, 4.65), 0)
+        self.assertGreater(star_analyser_wavelengths([100], 5000, 50, 4.65)[0], 0)
 
 
 if __name__ == "__main__":

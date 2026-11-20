@@ -32,12 +32,14 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ParamSpec("star_analyser", "Star Analyser", int, "star_analyser_radio", "Star Analyser",
               section="Réseau et optique"),
     ParamSpec("focal_mm", "Focal (mm)", int, "focal_field", "Focal"),
-    ParamSpec("pixel_size_um", "Pixel_size (µm)", float, "pixel_size_field", "Pixel_size"),
+    ParamSpec("pixel_size_um", "Pixel_size capteur natif (µm)", float, "pixel_size_field", "Pixel_size"),
     ParamSpec("lambda_min", "lambda_min (Å)", int, "lambda_min_field", "lambda_min",
               section="Fenêtre en longueur d’onde"),
     ParamSpec("lambda_max", "lambda_max (Å)", int, "lambda_max_field", "lambda_max"),
+    ParamSpec("centroid_radius", "Affinage de l’ordre zéro : rayon (px, 0 = désactivé)", int,
+              "centroid_radius_field", "centroid_radius", section="Extraction du spectre"),
     ParamSpec("spectrum_height", "Épaisseur de la bande du spectre (px)", int,
-              "spectrum_height_field", "spectrum_height", section="Extraction du spectre"),
+              "spectrum_height_field", "spectrum_height"),
     ParamSpec("sky_height", "Épaisseur de la bande du fond de ciel (px)", int,
               "sky_height_field", "sky_height"),
     ParamSpec("calibration_dir", "Répertoire des masters (vide = dossier de l’image)", str,
@@ -73,11 +75,12 @@ class AppParameters:
 
     star_analyser: int = 200
     focal_mm: int = 50
-    pixel_size_um: float = 4.65
+    pixel_size_um: float = 6.54  # Canon 6D
     lambda_min: int = 3500
     lambda_max: int = 7500
     line_size: int = 1
     line_type: str = "-"
+    centroid_radius: int = 8
     spectrum_height: int = 10
     sky_height: int = 20
     calibration_dir: str = ""
@@ -103,6 +106,8 @@ class AppParameters:
             raise ValueError("lambda_max must be greater than lambda_min.")
         if self.line_size <= 0:
             raise ValueError("line_size must be an integer greater than zero.")
+        if self.centroid_radius < 0:
+            raise ValueError("centroid_radius must be an integer greater than or equal to zero.")
         if self.spectrum_height <= 0 or self.sky_height <= 0:
             raise ValueError("spectrum_height and sky_height must be integers greater than zero.")
         if self.line_type not in VALID_LINE_TYPES:
