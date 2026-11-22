@@ -832,6 +832,17 @@ class ContrastCutsTests(unittest.TestCase):
 
 
 
+class PickerDirectoryTests(unittest.TestCase):
+    def test_initial_directory_ends_with_separator(self) -> None:
+        import os
+
+        with TemporaryDirectory() as directory, patch("pathlib.Path.home", return_value=Path(directory)):
+            app = QuickSpecFletApp()
+        for value in ("/data/images", "/data/images/"):
+            app.last_directory = value
+            self.assertEqual(app._picker_directory(), "/data/images" + os.sep)
+
+
 class SpectrumFilesAndResponseTests(unittest.TestCase):
     """Ouverture de spectres 1D, calcul et application de la réponse instrumentale."""
 

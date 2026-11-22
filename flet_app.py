@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 import random
 from typing import Callable, TypeAlias
@@ -683,7 +684,7 @@ class QuickSpecFletApp:
         try:
             selected = await self.picker.pick_files(
                 dialog_title="Choisir une ou plusieurs images",
-                initial_directory=self.last_directory,
+                initial_directory=self._picker_directory(),
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=IMAGE_EXTENSIONS + [e.upper() for e in IMAGE_EXTENSIONS],
                 allow_multiple=True,
@@ -1023,7 +1024,7 @@ class QuickSpecFletApp:
         """Sélecteur de fichiers de spectres (DAT, TXT, CSV, FITS) ; liste vide si annulé."""
         selected = await self.picker.pick_files(
             dialog_title=title,
-            initial_directory=self.last_directory,
+            initial_directory=self._picker_directory(),
             file_type=ft.FilePickerFileType.CUSTOM,
             allowed_extensions=SPECTRUM_EXTENSIONS + [e.upper() for e in SPECTRUM_EXTENSIONS],
             allow_multiple=multiple,
@@ -1207,6 +1208,10 @@ class QuickSpecFletApp:
         if self.image_status is not None:
             self.image_status.value = message
             self.image_status.update()
+
+    def _picker_directory(self) -> str:
+        """Dernier dossier avec un séparateur final : zenity (Linux) le prend sinon pour un fichier."""
+        return self.last_directory.rstrip(os.sep) + os.sep
 
     def _read_last_directory(self) -> str:
         return read_last_directory(self.location_file)
