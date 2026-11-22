@@ -22,7 +22,6 @@ from plotting import (  # noqa: F401  (certains noms sont ré-exportés pour les
     SPECTRUM_COLORS,
     VALID_LINE_TYPES,
     SpectrumTrace,
-    WavelengthLimits,
     AUTO_CUT_PERCENTILES,
     cut_limits,
     cut_percentile,
@@ -71,6 +70,7 @@ APPLICATION_LOGGERS = (
 )
 BAND_COLORS = ("#ff2020", "#3b82f6")  # bande du spectre (rouge), bande de ciel (bleu)
 BAND_LINE_PX = 1.0
+SPECTRUM_RENDER_SCALE = 2.0  # PNG du graphe rendu 2× pour rester net au zoom
 SECTION_NOTES = {
     "Réseau et optique": (
         "Réseau devant l’objectif : λ = d·sin(atan(x/f)), x = distance à l’ordre zéro. "
@@ -158,9 +158,9 @@ class QuickSpecFletApp:
         self.image_viewer: ft.InteractiveViewer | None = None
         self.image_status: ft.Text | None = None
         self.spectrum_status: ft.Text | None = None
-        self.spectrum_zoom_status: ft.Text | None = None
         self.spectrum_image: ft.Image | None = None
-        self.spectrum_gesture: ft.GestureDetector | None = None
+        self.spectrum_stage: ft.Container | None = None
+        self.spectrum_viewer: ft.InteractiveViewer | None = None
         self.spectrum_color_checkbox: ft.Checkbox | None = None
         self.spectrum_lines_checkbox: ft.Checkbox | None = None
         self.parameter_status: ft.Text | None = None
@@ -181,11 +181,7 @@ class QuickSpecFletApp:
         self._configure_spectra_processor()
 
         self.spectrum_traces: list[SpectrumTrace] = []
-        self.spectrum_xlim: WavelengthLimits | None = None
-        self._spectrum_drag_start_x: float | None = None
         self._spectrum_plot_size: StageSize | None = None  # zone d'affichage mesurée
-        self._spectrum_render_size: StageSize = DEFAULT_PLOT_SIZE  # taille du PNG affiché
-        self._spectrum_axes_x_limits: tuple[float, float] = (0.0942, 0.9629)
         self._spectrum_sequence = 0
         self.current_image_label = "Image"
         self.last_directory: str = self._read_last_directory()
@@ -341,16 +337,27 @@ class QuickSpecFletApp:
         self.spectrum_status = ft.Text(
             "Sélectionne trois points sur l’image pour extraire le spectre.", size=13
         )
+        # Le graphe est rendu en SPECTRUM_RENDER_SCALE × la zone affichée, puis zoomé à la pince
+        # (InteractiveViewer) sans nouveau rendu matplotlib.
         self.spectrum_image = ft.Image(
-            src=spectrum_png_data_uri(), fit=ft.BoxFit.CONTAIN, expand=True
+            src=spectrum_png_data_uri(), fit=ft.BoxFit.CONTAIN,
+            width=DEFAULT_PLOT_SIZE[0], height=DEFAULT_PLOT_SIZE[1],
         )
-        self.spectrum_gesture = ft.GestureDetector(
+        self.spectrum_viewer = ft.InteractiveViewer(
             content=self.spectrum_image,
-            on_pan_start=self._on_spectrum_pan_start,
-            on_pan_end=self._on_spectrum_pan_end,
+            expand=True,
+            min_scale=1,
+            max_scale=8,
+            pan_enabled=True,
+            scale_enabled=True,
+            constrained=True,
+        )
+        self.spectrum_stage = ft.Container(
+            expand=True,
+            bgcolor="#080b10",
+            content=self.spectrum_viewer,
             on_size_change=self._on_spectrum_plot_size_change,
             size_change_interval=150,
-            mouse_cursor=ft.MouseCursor.CLICK,
         )
         self.spectrum_color_checkbox = ft.Checkbox(
             label="Couleurs", value=False, on_change=self._on_spectrum_display_option_changed
@@ -358,7 +365,6 @@ class QuickSpecFletApp:
         self.spectrum_lines_checkbox = ft.Checkbox(
             label="Raies", value=False, on_change=self._on_spectrum_display_option_changed
         )
-        self.spectrum_zoom_status = ft.Text("", size=12)
         return ft.Column(
             expand=True,
             spacing=8,
@@ -378,9 +384,7 @@ class QuickSpecFletApp:
                     ],
                 ),
                 self.spectrum_status,
-                ft.Text("Glisse horizontalement sur le graphe pour zoomer.", size=12, color=ft.Colors.WHITE_70),
-                self.spectrum_zoom_status,
-                ft.Container(expand=True, bgcolor="#080b10", content=self.spectrum_gesture),
+                self.spectrum_stage,
             ],
         )
 
@@ -655,6 +659,7 @@ class QuickSpecFletApp:
         if not _size_changed(previous, new_size):
             return
         logger.debug("Zone du graphe : %s → %.0f × %.0f px", previous, *new_size)
+        self.spectrum_image.width, self.spectrum_image.height = new_size
         self._render_spectrum()
 
     # ------------------------------------------------------------------ image
@@ -1006,27 +1011,19 @@ class QuickSpecFletApp:
             details += f" — dispersion {dispersion:.2f} Å/px"
         return details
 
-    def _spectrum_data_limits(self) -> WavelengthLimits:
-        """Plage complète de longueurs d'onde des traces, avec 5 % de marge."""
-        wavelengths = np.concatenate([trace.wavelengths for trace in self.spectrum_traces])
-        low, high = float(np.min(wavelengths)), float(np.max(wavelengths))
-        margin = max(abs(low) * 0.05, 1.0) if low == high else (high - low) * 0.05
-        return low - margin, high + margin
-
     def _render_spectrum(self) -> None:
         """Re-génère le graphe à la taille mesurée de la zone d'affichage."""
         if self.spectrum_image is None:
             return
         size = self._spectrum_plot_size or DEFAULT_PLOT_SIZE
-        self._spectrum_render_size = size
-        self.spectrum_image.src, self._spectrum_axes_x_limits = _render_spectrum_plot(
+        self.spectrum_image.src, _ = _render_spectrum_plot(
             line_size=self.parameters.line_size,
             line_type=self.parameters.line_type,
             traces=tuple(self.spectrum_traces),
-            x_limits=self.spectrum_xlim,
             show_color_band=bool(self.spectrum_color_checkbox and self.spectrum_color_checkbox.value),
             show_element_lines=bool(self.spectrum_lines_checkbox and self.spectrum_lines_checkbox.value),
             size_px=size,
+            scale=SPECTRUM_RENDER_SCALE,
         )
         self.spectrum_image.update()
 
@@ -1037,67 +1034,21 @@ class QuickSpecFletApp:
         )
         self._render_spectrum()
 
-    def _on_spectrum_pan_start(self, event: ft.DragStartEvent) -> None:
-        self._spectrum_drag_start_x = (
-            float(event.local_position.x) if event.local_position is not None else None
-        )
-
-    def _on_spectrum_pan_end(self, event: ft.DragEndEvent) -> None:
-        """Zoome sur l'intervalle de longueurs d'onde balayé à la souris."""
-        start_x = self._spectrum_drag_start_x
-        end_x = float(event.local_position.x) if event.local_position is not None else None
-        self._spectrum_drag_start_x = None
-        if start_x is None or end_x is None or self._spectrum_plot_size is None or not self.spectrum_traces:
+    async def _reset_spectrum_zoom(self, _event: ft.ControlEvent) -> None:
+        """Remet le graphe à l'échelle 1, non déplacé."""
+        logger.info("Zoom du spectre réinitialisé")
+        if self.spectrum_viewer is None:
             return
-        # Le PNG affiché (taille de rendu) est centré dans la zone mesurée (ajustement « contain »).
-        plot_width, plot_height = self._spectrum_plot_size
-        render_width, render_height = self._spectrum_render_size
-        scale = min(plot_width / render_width, plot_height / render_height)
-        displayed_width = render_width * scale
-        image_left = (plot_width - displayed_width) / 2
-        start_fraction = (start_x - image_left) / displayed_width
-        end_fraction = (end_x - image_left) / displayed_width
-        axes_left, axes_right = self._spectrum_axes_x_limits
-        if not (
-            axes_left <= start_fraction <= axes_right
-            and axes_left <= end_fraction <= axes_right
-            and abs(end_fraction - start_fraction) * render_width >= 4
-        ):
-            logger.debug("Glissé hors des axes ou trop court : zoom ignoré")
-            return
-
-        visible_low, visible_high = self.spectrum_xlim or self._spectrum_data_limits()
-        axes_width = axes_right - axes_left
-
-        def to_wavelength(fraction: float) -> float:
-            return visible_low + (fraction - axes_left) / axes_width * (visible_high - visible_low)
-
-        a, b = to_wavelength(start_fraction), to_wavelength(end_fraction)
-        new_limits = (min(a, b), max(a, b))
-        if new_limits[0] >= new_limits[1]:
-            return
-        self.spectrum_xlim = new_limits
-        logger.info("Zoom : %.1f–%.1f Å", *new_limits)
-        self._render_spectrum()
-        self.spectrum_zoom_status.value = f"Zoom : {new_limits[0]:.1f}–{new_limits[1]:.1f} Å"
-        if self.page is not None:
-            self.page.update()
-
-    def _reset_spectrum_zoom(self, _event: ft.ControlEvent) -> None:
-        logger.info("Zoom réinitialisé")
-        self.spectrum_xlim = None
-        self._render_spectrum()
-        self.spectrum_zoom_status.value = ""
-        if self.page is not None:
-            self.page.update()
+        try:
+            await self.spectrum_viewer.reset()
+        except RuntimeError:
+            logger.debug("Visionneuse du spectre pas encore affichée : rien à réinitialiser")
 
     def _clear_spectrum(self, _event: ft.ControlEvent | None = None) -> None:
         logger.info("Effacement des %d spectre(s) affiché(s)", len(self.spectrum_traces))
         self.spectra_processor.result = None
         self.spectrum_traces.clear()
-        self.spectrum_xlim = None
         self.spectrum_status.value = self._spectrum_summary()
-        self.spectrum_zoom_status.value = ""
         self._render_spectrum()
         if self.page is not None:
             self.page.update()

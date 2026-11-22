@@ -315,6 +315,7 @@ def _render_spectrum_plot(
     show_color_band: bool = False,
     show_element_lines: bool = False,
     size_px: StageSize = DEFAULT_PLOT_SIZE,
+    scale: float = 1.0,
 ) -> tuple[str, tuple[float, float]]:
     """Dessine le graphe et renvoie ``(data URI PNG, (gauche, droite))`` des axes.
 
@@ -327,7 +328,9 @@ def _render_spectrum_plot(
         x_limits: Plage de longueurs d'onde visible (zoom).
         show_color_band: Affiche la bande de couleurs sous le graphe.
         show_element_lines: Marque les raies H/He/Na/Mg/Ca.
-        size_px: Taille de l'image produite en pixels (celle de la zone d'affichage).
+        size_px: Taille d'affichage de l'image en pixels (celle de la zone d'affichage).
+        scale: Facteur de suréchantillonnage : le PNG fait ``size_px × scale`` pixels pour la
+            même mise en page (texte et traits inclus), afin de rester net quand on zoome.
 
     Returns:
         Le PNG et les bornes horizontales des axes (fractions de la figure).
@@ -346,7 +349,7 @@ def _render_spectrum_plot(
         raise ValueError("Wavelength limits must be finite and increasing.")
 
     width_px, height_px = _clamp_size(size_px)
-    figure = Figure(figsize=(width_px / PLOT_DPI, height_px / PLOT_DPI), dpi=PLOT_DPI, facecolor=_BG)
+    figure = Figure(figsize=(width_px / PLOT_DPI, height_px / PLOT_DPI), dpi=PLOT_DPI * scale, facecolor=_BG)
     if show_color_band:
         grid = figure.add_gridspec(2, 1, height_ratios=(12, 1), hspace=0.04)
         axes = figure.add_subplot(grid[0])

@@ -1,12 +1,13 @@
 """Tests for Flet image display, coordinate mapping and SA100 workflow."""
 
+import asyncio
 import base64
 from io import BytesIO
 import logging
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import flet as ft
 import numpy as np
@@ -245,7 +246,7 @@ class FletImageTests(unittest.TestCase):
                 self.assertEqual(page.services, [app.picker])
                 self.assertEqual(len(page.controls), 1)
                 self.assertIsInstance(app.spectrum_image, ft.Image)
-                self.assertTrue(app.spectrum_image.expand)
+                self.assertTrue(app.spectrum_stage.expand)
                 self.assertFalse(app.spectrum_color_checkbox.value)
                 self.assertFalse(app.spectrum_lines_checkbox.value)
                 self.assertIsInstance(app.log_view, ft.ListView)
@@ -484,78 +485,37 @@ class FletImageTests(unittest.TestCase):
             set(SPECTRUM_COLORS),
         )
 
-    def test_spectrum_drag_zoom_regenerates_plot_and_reset_restores_full_range(
-        self,
-    ) -> None:
-        """Zoom to a dragged wavelength interval and restore the full plot."""
+    def test_spectrum_zoom_is_pinch_viewer_without_rerender(self) -> None:
+        """Le zoom est un InteractiveViewer : aucun nouveau rendu matplotlib, reset async."""
         app = QuickSpecFletApp()
         app.build(FakePage())
-        app._add_spectrum_trace(
-            np.arange(4000, 7001, dtype=np.float64),
-            np.linspace(1, 3, 3001, dtype=np.float32),
-        )
-        width, height = 770.0, 440.0
+        self.assertIsInstance(app.spectrum_viewer, ft.InteractiveViewer)
+        self.assertTrue(app.spectrum_viewer.scale_enabled)
+        self.assertIs(app.spectrum_viewer.content, app.spectrum_image)
+        self.assertFalse(hasattr(app, "spectrum_xlim"))
+        with (
+            patch.object(app.spectrum_image, "update"),
+            patch("flet_app._render_spectrum_plot", wraps=_render_spectrum_plot) as render,
+            patch.object(app.spectrum_viewer, "reset", new_callable=AsyncMock) as reset,
+        ):
+            asyncio.run(app._reset_spectrum_zoom(ft.ControlEvent(name="on_click", control=None)))
+        reset.assert_awaited_once()
+        render.assert_not_called()
+
+    def test_spectrum_png_is_rendered_at_double_resolution(self) -> None:
+        """Le PNG fait 2× la zone affichée, qui reste la taille de l'image à l'écran."""
+        app = QuickSpecFletApp()
+        app.build(FakePage())
         with patch.object(app.spectrum_image, "update"):
             app._on_spectrum_plot_size_change(
                 ft.LayoutSizeChangeEvent(
-                    name="on_size_change",
-                    control=app.spectrum_gesture,
-                    width=width,
-                    height=height,
+                    name="on_size_change", control=app.spectrum_stage, width=800, height=450
                 )
             )
-            app._render_spectrum()
-        axes_left, axes_right = app._spectrum_axes_x_limits
-        plot_width = axes_right - axes_left
-        start = width * (axes_left + plot_width * 0.2)
-        end = width * (axes_left + plot_width * 0.7)
-        with (
-            patch.object(app.page, "update"),
-            patch.object(app.spectrum_image, "update"),
-            patch.object(app.spectrum_zoom_status, "update"),
-            patch(
-                "flet_app._render_spectrum_plot",
-                wraps=_render_spectrum_plot,
-            ) as render_spectrum,
-        ):
-            app._on_spectrum_pan_start(
-                ft.DragStartEvent(
-                    name="on_pan_start",
-                    control=app.spectrum_gesture,
-                    kind=ft.PointerDeviceType.MOUSE,
-                    local_position=ft.Offset(start, 100),
-                    global_position=ft.Offset(start, 100),
-                )
-            )
-            render_spectrum.assert_not_called()
-            app.page.update.assert_not_called()
-
-            app._on_spectrum_pan_end(
-                ft.DragEndEvent(
-                    name="on_pan_end",
-                    control=app.spectrum_gesture,
-                    local_position=ft.Offset(end, 100),
-                    global_position=ft.Offset(end, 100),
-                    velocity=ft.Offset(0, 0),
-                )
-            )
-            self.assertIsNotNone(app.spectrum_xlim)
-            self.assertLess(
-                app.spectrum_xlim[1] - app.spectrum_xlim[0],
-                app._spectrum_data_limits()[1] - app._spectrum_data_limits()[0],
-            )
-            render_spectrum.assert_called_once()
-            self.assertEqual(
-                render_spectrum.call_args.kwargs["x_limits"],
-                app.spectrum_xlim,
-            )
-
-            app._reset_spectrum_zoom(
-                ft.ControlEvent(name="on_click", control=None)
-            )
-        self.assertIsNone(app.spectrum_xlim)
-        self.assertIsNone(app.spectrum_xlim)
-        self.assertEqual(render_spectrum.call_count, 2)
+        self.assertEqual((app.spectrum_image.width, app.spectrum_image.height), (800.0, 450.0))
+        decoded = base64.b64decode(app.spectrum_image.src.removeprefix("data:image/png;base64,"))
+        with PillowImage.open(BytesIO(decoded)) as chart:
+            self.assertEqual(chart.size, (1600, 900))
 
     def test_loading_another_image_preserves_traces_and_clear_removes_them(
         self,
@@ -584,7 +544,6 @@ class FletImageTests(unittest.TestCase):
         with patch.object(app.spectrum_image, "update"):
             app._clear_spectrum()
         self.assertEqual(app.spectrum_traces, [])
-        self.assertIsNone(app.spectrum_xlim)
 
     def test_three_image_taps_extract_spectrum_and_open_spectrum_tab(
         self,
@@ -660,7 +619,7 @@ class DynamicSizeTests(unittest.TestCase):
 
         def event(width: float, height: float) -> ft.LayoutSizeChangeEvent:
             return ft.LayoutSizeChangeEvent(
-                name="on_size_change", control=app.spectrum_gesture, width=width, height=height
+                name="on_size_change", control=app.spectrum_stage, width=width, height=height
             )
 
         with (
@@ -841,8 +800,8 @@ class ContrastCutsTests(unittest.TestCase):
         app = QuickSpecFletApp()
         app.build(FakePage())
         toolbar = app.tab_pages[0].controls[0].controls
-        self.assertEqual(toolbar[0].content, "Ouvrir une image")
-        self.assertEqual(toolbar[1].content, "Sélection SA100")
+        self.assertEqual(toolbar[0].content, "Ouvrir des images")
+        self.assertEqual(toolbar[1].content, "Sélection des points")
         self.assertIn(app.cut_slider, toolbar[2].controls)
         self.assertIs(toolbar[3], app.rectified_checkbox)
 
