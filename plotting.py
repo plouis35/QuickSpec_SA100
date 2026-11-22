@@ -55,16 +55,20 @@ ELEMENT_LINES: tuple[tuple[float, str, str], ...] = (
     (4861.33, "Hβ", "H"),
     (6562.80, "Hα", "H"),
     (4471.48, "He I", "He I"),
-    (5875.62, "He I", "He I"),
+    #(5875.62, "He I", "He I"),
     (6678.15, "He I", "He I"),
-    (7065.19, "He I", "He I"),
-    (5889.95, "Na D2", "Na I"),
-    (5895.92, "Na D1", "Na I"),
-    (5167.32, "Mg b4", "Mg I"),
-    (5172.68, "Mg b2", "Mg I"),
-    (5183.60, "Mg b1", "Mg I"),
-    (3933.66, "Ca K", "Ca II"),
-    (3968.47, "Ca H", "Ca II"),
+    #(7065.19, "He I", "He I"),
+    #(5889.95, "Na D2", "Na I"),
+    #(5895.92, "Na D1", "Na I"),
+    (5892, "Na", "Na I"),
+    #(5167.32, "Mg b4", "Mg I"),
+    #(5172.68, "Mg b2", "Mg I"),
+    (5175.0, "Mg", "Mg I"),
+    #(5183.60, "Mg b1", "Mg I"),
+    #(3933.66, "Ca K", "Ca II"),
+    #(3968.47, "Ca H", "Ca II"),
+    (3950.0, "Ca", "Ca II"),
+
 )
 VALID_LINE_TYPES = {
     "-", "--", "-.", ":", "None", "none", " ", "",
@@ -85,7 +89,9 @@ _COLOR_VALUES = np.array(
     ],
     dtype=np.float64,
 )
-_BG = "#111827"
+#_BG = "#111827"
+_BG = "#000000"
+
 
 
 @dataclass(frozen=True)
@@ -349,7 +355,7 @@ def _render_spectrum_plot(
         axes = figure.add_subplot(111)
         color_axes = None
     axes.set_facecolor(_BG)
-    axes.set_title("Spectre SA100", color="#f9fafb")
+    #axes.set_title("Spectre SA100", color="#f9fafb")
     axes.set_ylabel("Flux", color="#e5e7eb")
     axes.tick_params(colors="#d1d5db")
     axes.grid(color="#374151", alpha=0.8)

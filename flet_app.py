@@ -70,7 +70,7 @@ APPLICATION_LOGGERS = (
     logging.getLogger("settings"),
 )
 BAND_COLORS = ("#ff2020", "#3b82f6")  # bande du spectre (rouge), bande de ciel (bleu)
-BAND_LINE_PX = 2.0
+BAND_LINE_PX = 1.0
 SECTION_NOTES = {
     "Réseau et optique": (
         "Réseau devant l’objectif : λ = d·sin(atan(x/f)), x = distance à l’ordre zéro. "
@@ -89,7 +89,7 @@ SECTION_NOTES = {
     ),
     "Affichage du spectre": "Styles Matplotlib : -, --, -., :, solid, dashed, dashdot, dotted",
 }
-SIZE_TOLERANCE_PX = 2.0  # variation de taille ignorée (évite de re-rendre pour rien)
+SIZE_TOLERANCE_PX = 2.0  # variation de taille ignorée (évite de re-afficher pour rien)
 ImagePoint: TypeAlias = tuple[float, float]
 StageSize: TypeAlias = tuple[float, float]
 _active_log_handler: logging.Handler | None = None
@@ -256,7 +256,7 @@ class QuickSpecFletApp:
         self.image_status = ft.Text(
             "Ouvre une ou plusieurs images, puis sélectionne l’ordre zéro, le spectre et le ciel.", size=13
         )
-        # Le placeholder épouse la zone (left/top/right/bottom) : plus de taille figée.
+        # Le placeholder épouse la zone (left/top/right/bottom).
         self.image_stack = ft.Stack(
             width=self.stage_size[0],
             height=self.stage_size[1],
@@ -296,8 +296,8 @@ class QuickSpecFletApp:
                     wrap=True,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.Button("Ouvrir une image", icon=ft.Icons.FOLDER_OPEN, on_click=self._open_picker),
-                        ft.Button("Sélection SA100", icon=ft.Icons.TOUCH_APP, on_click=self._begin_selection),
+                        ft.Button("Ouvrir des images", icon=ft.Icons.FOLDER_OPEN, on_click=self._open_picker),
+                        ft.Button("Sélection des points", icon=ft.Icons.TOUCH_APP, on_click=self._begin_selection),
                         ft.Row(  # curseurs de contraste : restent groupés quand la ligne se replie
                             tight=True,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -308,10 +308,11 @@ class QuickSpecFletApp:
                                     ft.Icons.AUTO_FIX_HIGH, tooltip="Contraste automatique",
                                     on_click=self._on_cuts_auto,
                                 ),
+                                self.rectified_checkbox,
                             ],
                         ),
-                        self.rectified_checkbox,
-                        ft.Text("Pince pour zoomer · glisse pour déplacer", size=12),
+                        #self.rectified_checkbox,
+                        #ft.Text("Pince pour zoomer · glisse pour déplacer", size=12),
                     ],
                 ),
                 self.image_status,
@@ -355,7 +356,7 @@ class QuickSpecFletApp:
             label="Couleurs", value=False, on_change=self._on_spectrum_display_option_changed
         )
         self.spectrum_lines_checkbox = ft.Checkbox(
-            label="Raies H/He/Na/Mg/Ca", value=False, on_change=self._on_spectrum_display_option_changed
+            label="Raies", value=False, on_change=self._on_spectrum_display_option_changed
         )
         self.spectrum_zoom_status = ft.Text("", size=12)
         return ft.Column(
@@ -364,7 +365,7 @@ class QuickSpecFletApp:
             controls=[
                 ft.Row(
                     controls=[
-                        ft.Text("Spectre SA100", size=20, weight=ft.FontWeight.BOLD),
+                        #ft.Text("Spectre SA100", size=20, weight=ft.FontWeight.BOLD),
                         ft.Row(
                             wrap=True,
                             controls=[
@@ -379,7 +380,7 @@ class QuickSpecFletApp:
                 self.spectrum_status,
                 ft.Text("Glisse horizontalement sur le graphe pour zoomer.", size=12, color=ft.Colors.WHITE_70),
                 self.spectrum_zoom_status,
-                ft.Container(expand=True, content=self.spectrum_gesture),
+                ft.Container(expand=True, bgcolor="#080b10", content=self.spectrum_gesture),
             ],
         )
 
@@ -887,9 +888,9 @@ class QuickSpecFletApp:
                 ft.Icon(
                     ft.Icons.CLOSE,
                     color=MARKER_COLORS[index],
-                    size=22,
-                    left=left + x / self.image_shape[1] * display_width - 11,
-                    top=top + y / self.image_shape[0] * display_height - 11,
+                    size=12,
+                    left=left + x / self.image_shape[1] * display_width - 6,
+                    top=top + y / self.image_shape[0] * display_height - 6,
                 )
             )
         self._apply_stage_size()
