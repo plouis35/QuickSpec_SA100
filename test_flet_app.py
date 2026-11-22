@@ -275,7 +275,7 @@ class FletImageTests(unittest.TestCase):
             self.assertEqual(app.log_view.controls, [])
 
     def test_log_severity_colors_and_debug_checkbox(self) -> None:
-        """Color log levels and toggle DEBUG and TRACE visibility."""
+        """Color log levels and toggle DEBUG visibility."""
         app = QuickSpecFletApp()
         app.build(FakePage())
         app._clear_logs()  # écarte les logs de démarrage
@@ -289,23 +289,21 @@ class FletImageTests(unittest.TestCase):
             app.debug_checkbox.value = True
             app._on_debug_changed(event)
             image_logger.debug("visible debug message")
-            image_logger.log(5, "visible trace message")
             image_logger.warning("warning message")
             image_logger.error("error message")
             image_logger.log(25, "other level message")
 
-        self.assertEqual(len(app.log_view.controls), 5)
+        self.assertEqual(len(app.log_view.controls), 4)
         self.assertEqual(
             [control.color for control in app.log_view.controls],
-            ["#ffffff", "#ffffff", "#facc15", "#ef4444", "#ffffff"],
+            ["#ffffff", "#facc15", "#ef4444", "#ffffff"],
         )
-        self.assertIn("TRACE", app.log_view.controls[1].value)
 
         app.debug_checkbox.value = False
         app._on_debug_changed(event)
         with patch.object(app.page, "update"):
             image_logger.debug("hidden again")
-        self.assertEqual(len(app.log_view.controls), 5)
+        self.assertEqual(len(app.log_view.controls), 4)
 
     def test_parameters_are_saved_applied_and_loaded(self) -> None:
         """Persist validated parameter values and restore them on next launch."""

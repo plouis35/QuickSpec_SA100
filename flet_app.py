@@ -47,8 +47,6 @@ from spectrum_io import SPECTRUM_EXTENSIONS, read_spectrum
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-TRACE_LEVEL = 5
-logging.addLevelName(TRACE_LEVEL, "TRACE")
 
 MARKER_COLORS = ("#ff3030", "#22c55e", "#3b82f6")
 MARKER_NAMES = ("ordre zéro", "trace du spectre", "fond de ciel")
@@ -587,8 +585,8 @@ class QuickSpecFletApp:
         self._set_debug_logging(bool(self.debug_checkbox and self.debug_checkbox.value))
 
     def _set_debug_logging(self, enabled: bool) -> None:
-        """Règle la verbosité (INFO, ou DEBUG/TRACE si activé) des loggers et de l'interface."""
-        level = TRACE_LEVEL if enabled else logging.INFO
+        """Règle la verbosité (INFO, ou DEBUG si activé) des loggers et de l'interface."""
+        level = logging.DEBUG if enabled else logging.INFO
         if self.log_handler is not None:
             self.log_handler.setLevel(level)
         for application_logger in APPLICATION_LOGGERS:
