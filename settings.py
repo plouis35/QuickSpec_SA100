@@ -51,6 +51,14 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
               "dark_name_field", "Master dark"),
     ParamSpec("flat_name", "Master flat (nom, sans extension)", str,
               "flat_name_field", "Master flat"),
+    ParamSpec("response_name", "Réponse instrumentale (nom, sans extension ; vide = désactivée)", str,
+              "response_name_field", "Réponse instrumentale", section="Réponse instrumentale"),
+    ParamSpec("response_degree", "Degré du polynôme d’ajustement", int,
+              "response_degree_field", "Degré du polynôme"),
+    ParamSpec("response_smooth_px", "Résolution de l’instrument (px, pour lisser la référence)", float,
+              "response_smooth_px_field", "Résolution de l’instrument"),
+    ParamSpec("response_line_mask", "Demi-largeur masquée autour des raies de Balmer (Å)", int,
+              "response_line_mask_field", "Demi-largeur des raies"),
     ParamSpec("line_size", "line_size", int, "line_size_field", "line_size",
               section="Affichage du spectre"),
     ParamSpec("line_type", "line_type (ls=...)", str, "line_type_field", "line_type", strip=False),
@@ -87,6 +95,10 @@ class AppParameters:
     offset_name: str = "master_offset"
     dark_name: str = "master_dark"
     flat_name: str = "master_flat"
+    response_name: str = "master_response"
+    response_degree: int = 6
+    response_smooth_px: float = 3.0
+    response_line_mask: int = 60
 
     def __post_init__(self) -> None:
         """Rejette les types et valeurs invalides."""
@@ -110,6 +122,12 @@ class AppParameters:
             raise ValueError("centroid_radius must be an integer greater than or equal to zero.")
         if self.spectrum_height <= 0 or self.sky_height <= 0:
             raise ValueError("spectrum_height and sky_height must be integers greater than zero.")
+        if not 1 <= self.response_degree <= 12:
+            raise ValueError("Degré du polynôme must be an integer between 1 and 12.")
+        if not math.isfinite(self.response_smooth_px) or self.response_smooth_px < 0:
+            raise ValueError("Résolution de l’instrument must be a finite number, zero or greater.")
+        if self.response_line_mask < 0:
+            raise ValueError("Demi-largeur des raies must be an integer, zero or greater.")
         if self.line_type not in VALID_LINE_TYPES:
             raise ValueError("line_type must be a supported Matplotlib line style.")
 

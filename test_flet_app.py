@@ -831,5 +831,80 @@ class ContrastCutsTests(unittest.TestCase):
         self.assertAlmostEqual(app.cut_slider.end_value, cut_position(99.5))
 
 
+
+class SpectrumFilesAndResponseTests(unittest.TestCase):
+    """Ouverture de spectres 1D, calcul et application de la réponse instrumentale."""
+
+    def make_app(self, directory: str) -> QuickSpecFletApp:
+        from dataclasses import replace
+
+        with patch("pathlib.Path.home", return_value=Path(directory)):
+            app = QuickSpecFletApp()
+        app.build(FakePage())
+        app.parameters = replace(app.parameters, calibration_dir=directory, lambda_min=3600, lambda_max=7400)
+        return app
+
+    def test_open_spectrum_file_adds_labelled_trace_and_normalize_option(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "A1V_demo.dat"
+            path.write_text("4000 10\n5000 40\n6000 20\n")
+            app = self.make_app(directory)
+            with patch.object(app.spectrum_image, "update"), patch.object(app.page, "update"):
+                app.add_spectrum_from_file(path)
+                self.assertEqual([t.label for t in app.spectrum_traces], ["A1V_demo.dat"])
+                app.spectrum_normalize_checkbox.value = True
+                shown = app._display_traces()
+        self.assertAlmostEqual(float(shown[0].flux.max()), 1.0)
+        self.assertEqual(float(app.spectrum_traces[0].flux.max()), 40.0)  # données intactes
+
+    def test_compute_response_saves_master_and_it_divides_next_spectra(self) -> None:
+        from types import SimpleNamespace
+
+        from response import smooth_reference
+        from test_response import instrument, reference_star
+
+        ref_wl, ref_flux = reference_star()
+        grid = np.arange(3600.0, 7400.0, 13.1)
+        measured = np.interp(grid, ref_wl, smooth_reference(ref_wl, ref_flux, 3 * 13.1)) * instrument(grid) * 1000
+        with TemporaryDirectory() as directory:
+            ref_path = Path(directory) / "ref.dat"
+            from spectrum_io import write_spectrum
+
+            write_spectrum(ref_path, ref_wl, ref_flux)
+            app = self.make_app(directory)
+            app.spectra_processor.result = SimpleNamespace(wavelengths=grid, flux=measured)
+            with patch.object(app.spectrum_image, "update"), patch.object(app.page, "update"):
+                saved = app.compute_response(ref_path)
+                self.assertEqual(saved, Path(directory) / "master_response.dat")
+                self.assertTrue(saved.is_file())
+                wl, flux, corrected = app._apply_instrument_response(grid, measured)
+        self.assertTrue(corrected)
+        self.assertLess(wl.size, grid.size + 1)
+        # le spectre de l'étoile de référence, corrigé, perd la forme de la réponse de l'instrument
+        raw_swing = measured.max() / measured.min()
+        self.assertLess(flux.max() / flux.min(), raw_swing)
+
+    def test_without_master_or_with_empty_name_spectrum_is_untouched(self) -> None:
+        from dataclasses import replace
+
+        with TemporaryDirectory() as directory:
+            app = self.make_app(directory)
+            wl, flux = np.array([4000.0, 5000.0]), np.array([1.0, 2.0])
+            self.assertFalse(app._apply_instrument_response(wl, flux)[2])
+            app.parameters = replace(app.parameters, response_name="")
+            self.assertFalse(app._apply_instrument_response(wl, flux)[2])
+
+    def test_compute_response_requires_an_extracted_spectrum(self) -> None:
+        with TemporaryDirectory() as directory:
+            app = self.make_app(directory)
+            with self.assertRaises(ValueError):
+                app.compute_response(Path(directory) / "ref.dat")
+
+    def test_response_parameters_are_in_the_form(self) -> None:
+        with TemporaryDirectory() as directory:
+            app = self.make_app(directory)
+        for name in ("response_name", "response_degree", "response_smooth_px", "response_line_mask"):
+            self.assertIn(name, app.param_fields)
+
 if __name__ == "__main__":
     unittest.main()

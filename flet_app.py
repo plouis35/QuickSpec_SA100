@@ -42,7 +42,9 @@ from settings import (
     save_parameters,
     write_last_directory,
 )
+from response import apply_response, compute_response, load_response, save_response
 from spectra_processing import Spectra, refine_centroid
+from spectrum_io import SPECTRUM_EXTENSIONS, read_spectrum
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -76,6 +78,10 @@ SECTION_NOTES = {
         "Réseau devant l’objectif : λ = d·sin(atan(x/f)), x = distance à l’ordre zéro. "
         "La taille de pixel est celle du capteur natif ; le binning 2×2 des JPEG/TIFF couleur "
         "est pris en compte automatiquement."
+    ),
+    "Réponse instrumentale": (
+        "Le spectre extrait est divisé par cette réponse si le fichier existe dans le répertoire des "
+        "masters. Elle se calcule dans l’onglet Spectre à partir d’une étoile de référence."
     ),
     "Extraction du spectre": (
         "Épaisseur totale des bandes de binning, centrées sur la trace du spectre "
@@ -163,6 +169,7 @@ class QuickSpecFletApp:
         self.spectrum_viewer: ft.InteractiveViewer | None = None
         self.spectrum_color_checkbox: ft.Checkbox | None = None
         self.spectrum_lines_checkbox: ft.Checkbox | None = None
+        self.spectrum_normalize_checkbox: ft.Checkbox | None = None
         self.parameter_status: ft.Text | None = None
         # Contrôles du formulaire, créés depuis PARAM_SPECS : param_fields[nom] et
         # un attribut par paramètre (star_analyser_radio, focal_field, ...).
@@ -365,6 +372,9 @@ class QuickSpecFletApp:
         self.spectrum_lines_checkbox = ft.Checkbox(
             label="Raies", value=False, on_change=self._on_spectrum_display_option_changed
         )
+        self.spectrum_normalize_checkbox = ft.Checkbox(
+            label="Normalisé", value=False, on_change=self._on_spectrum_display_option_changed
+        )
         return ft.Column(
             expand=True,
             spacing=8,
@@ -375,10 +385,13 @@ class QuickSpecFletApp:
                         ft.Row(
                             wrap=True,
                             controls=[
+                                ft.Button("Ouvrir un spectre", icon=ft.Icons.FILE_OPEN, on_click=self._open_spectrum_file),
+                                ft.Button("Calculer la réponse", icon=ft.Icons.TUNE, on_click=self._compute_response_from_file),
                                 ft.Button("Reset zoom", icon=ft.Icons.ZOOM_OUT_MAP, on_click=self._reset_spectrum_zoom),
                                 ft.Button("Clear", icon=ft.Icons.DELETE_OUTLINE, on_click=self._clear_spectrum),
                                 self.spectrum_color_checkbox,
                                 self.spectrum_lines_checkbox,
+                                self.spectrum_normalize_checkbox,
                             ],
                         ),
                     ],
@@ -957,9 +970,12 @@ class QuickSpecFletApp:
                 self.page.update()
             return
 
-        self._add_spectrum_trace(result.wavelengths, result.flux, replace_latest=replace_latest)
+        wavelengths, flux, corrected = self._apply_instrument_response(result.wavelengths, result.flux)
+        self._add_spectrum_trace(wavelengths, flux, replace_latest=replace_latest)
         self._render_spectrum()
         self.spectrum_status.value = self._spectrum_summary(result.dispersion_angstrom_per_pixel)
+        if corrected:
+            self.spectrum_status.value += " — divisé par la réponse instrumentale"
         self._set_show_rectified(True)
         self._refresh_image_controls()
         self._show_image_status(
@@ -975,8 +991,128 @@ class QuickSpecFletApp:
 
     # ------------------------------------------------------------------ spectre
 
+    def _masters_directory(self) -> Path:
+        """Répertoire des masters : celui des paramètres, sinon le dossier de l'image ouverte."""
+        if self.parameters.calibration_dir:
+            return Path(self.parameters.calibration_dir)
+        if self.image_processor.paths:
+            return Path(self.image_processor.paths[0]).parent
+        return Path(self.last_directory)
+
+    def _apply_instrument_response(
+        self, wavelengths: ArrayLike, flux: ArrayLike
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Divise le spectre par la réponse instrumentale si elle existe ; renvoie aussi un indicateur."""
+        wavelengths = np.asarray(wavelengths, dtype=np.float64)
+        flux = np.asarray(flux, dtype=np.float64)
+        name = self.parameters.response_name
+        if not name:
+            logger.info("Réponse instrumentale désactivée (nom vide)")
+            return wavelengths, flux, False
+        response = load_response(self._masters_directory(), name)
+        if response is None:
+            return wavelengths, flux, False
+        try:
+            wavelengths, flux = apply_response(wavelengths, flux, response)
+        except ValueError as exc:
+            logger.warning("Réponse instrumentale non appliquée : %s", exc)
+            return wavelengths, flux, False
+        return wavelengths, flux, True
+
+    async def _pick_spectrum_files(self, title: str, *, multiple: bool) -> list[Path]:
+        """Sélecteur de fichiers de spectres (DAT, TXT, CSV, FITS) ; liste vide si annulé."""
+        selected = await self.picker.pick_files(
+            dialog_title=title,
+            initial_directory=self.last_directory,
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=SPECTRUM_EXTENSIONS + [e.upper() for e in SPECTRUM_EXTENSIONS],
+            allow_multiple=multiple,
+        )
+        if not selected:
+            logger.info("Sélection de spectre annulée")
+            return []
+        if not all(file.path for file in selected):
+            raise ValueError("Le sélecteur n’a pas fourni de chemin de fichier.")
+        paths = [Path(file.path) for file in selected]
+        self.last_directory = str(paths[0].parent)
+        self._save_last_directory()
+        return paths
+
+    def _show_spectrum_message(self, message: str) -> None:
+        self.spectrum_status.value = message
+        if self.page is not None:
+            self.page.update()
+
+    async def _open_spectrum_file(self, _event: ft.ControlEvent) -> None:
+        """Ajoute au graphe un ou plusieurs spectres 1D lus depuis des fichiers."""
+        try:
+            for path in await self._pick_spectrum_files("Choisir un ou plusieurs spectres", multiple=True):
+                self.add_spectrum_from_file(path)
+        except (OSError, ValueError) as exc:
+            logger.warning("Ouverture du spectre impossible : %s", exc)
+            self._show_spectrum_message(f"Ouverture impossible : {exc}")
+
+    def add_spectrum_from_file(self, path: Path) -> None:
+        """Lit un spectre 1D et l'ajoute comme trace (sans correction : il est déjà calibré)."""
+        wavelengths, flux = read_spectrum(path)
+        self._add_spectrum_trace(wavelengths, flux, label=path.name)
+        self._render_spectrum()
+        self._show_spectrum_message(self._spectrum_summary())
+
+    async def _compute_response_from_file(self, _event: ft.ControlEvent) -> None:
+        """Choisit le spectre de référence et calcule la réponse à partir du dernier spectre extrait."""
+        if self.spectra_processor.result is None:
+            self._show_spectrum_message(
+                "Extrais d’abord le spectre de l’étoile de référence (trois points sur l’image)."
+            )
+            return
+        try:
+            paths = await self._pick_spectrum_files("Spectre de référence (MILES, CALSPEC…)", multiple=False)
+            if paths:
+                self.compute_response(paths[0])
+        except (OSError, ValueError) as exc:
+            logger.warning("Calcul de la réponse impossible : %s", exc)
+            self._show_spectrum_message(f"Calcul de la réponse impossible : {exc}")
+
+    def compute_response(self, reference_path: Path) -> Path:
+        """Calcule et enregistre la réponse instrumentale, puis recalcule le spectre courant.
+
+        Raises:
+            ValueError: Si aucun spectre n'est extrait, si le nom de la réponse est vide ou si
+                l'ajustement échoue.
+        """
+        p, result = self.parameters, self.spectra_processor.result
+        if result is None:
+            raise ValueError("aucun spectre extrait")
+        if not p.response_name:
+            raise ValueError("le nom de la réponse instrumentale est vide (onglet Parameters)")
+        logger.info("Calcul de la réponse instrumentale avec la référence %s", reference_path.name)
+        reference_wavelengths, reference_flux = read_spectrum(reference_path)
+        fit = compute_response(
+            result.wavelengths, result.flux, reference_wavelengths, reference_flux,
+            degree=p.response_degree,
+            smooth_px=p.response_smooth_px,
+            line_half_width=float(p.response_line_mask),
+            lambda_min=float(p.lambda_min),
+            lambda_max=float(p.lambda_max),
+        )
+        directory = self._masters_directory()
+        saved = save_response(directory, p.response_name, fit)
+        if len(self.selection_points) == 3 and self.image_processor.data is not None:
+            self._extract_spectrum(replace_latest=True)  # affiche le spectre déjà corrigé
+        self._show_spectrum_message(
+            f"Réponse enregistrée : {saved} (λ {fit.wavelengths[0]:.0f}–{fit.wavelengths[-1]:.0f} Å, "
+            f"écart autour du polynôme {fit.rms_percent:.1f} %)."
+        )
+        return saved
+
     def _add_spectrum_trace(
-        self, wavelengths: ArrayLike, flux: ArrayLike, *, replace_latest: bool = False
+        self,
+        wavelengths: ArrayLike,
+        flux: ArrayLike,
+        *,
+        replace_latest: bool = False,
+        label: str | None = None,
     ) -> None:
         """Ajoute une trace colorée (la plus ancienne est remplacée si le graphe est plein)."""
         x_values = np.asarray(wavelengths, dtype=np.float64).copy()
@@ -996,7 +1132,7 @@ class QuickSpecFletApp:
         used = {trace.color for trace in self.spectrum_traces}
         color = random.choice([c for c in SPECTRUM_COLORS if c not in used])
         self._spectrum_sequence += 1
-        label = f"{self._spectrum_sequence} — {self.current_image_label}"
+        label = label or f"{self._spectrum_sequence} — {self.current_image_label}"
         self.spectrum_traces.append(SpectrumTrace(x_values, y_values, color, label))
         logger.info(
             "Trace « %s » ajoutée (%d points, λ %.0f–%.0f Å, couleur %s)",
@@ -1011,6 +1147,17 @@ class QuickSpecFletApp:
             details += f" — dispersion {dispersion:.2f} Å/px"
         return details
 
+    def _display_traces(self) -> tuple[SpectrumTrace, ...]:
+        """Traces à tracer ; avec « Normalisé », chacune est ramenée à un maximum de 1."""
+        if not (self.spectrum_normalize_checkbox and self.spectrum_normalize_checkbox.value):
+            return tuple(self.spectrum_traces)
+        normalized = []
+        for trace in self.spectrum_traces:
+            peak = float(np.nanmax(trace.flux)) if trace.flux.size else 0.0
+            flux = trace.flux / peak if peak > 0 else trace.flux
+            normalized.append(SpectrumTrace(trace.wavelengths, flux.astype(np.float32), trace.color, trace.label))
+        return tuple(normalized)
+
     def _render_spectrum(self) -> None:
         """Re-génère le graphe à la taille mesurée de la zone d'affichage."""
         if self.spectrum_image is None:
@@ -1019,7 +1166,7 @@ class QuickSpecFletApp:
         self.spectrum_image.src, _ = _render_spectrum_plot(
             line_size=self.parameters.line_size,
             line_type=self.parameters.line_type,
-            traces=tuple(self.spectrum_traces),
+            traces=self._display_traces(),
             show_color_band=bool(self.spectrum_color_checkbox and self.spectrum_color_checkbox.value),
             show_element_lines=bool(self.spectrum_lines_checkbox and self.spectrum_lines_checkbox.value),
             size_px=size,
@@ -1029,8 +1176,9 @@ class QuickSpecFletApp:
 
     def _on_spectrum_display_option_changed(self, _event: ft.ControlEvent) -> None:
         logger.info(
-            "Affichage : couleurs=%s raies=%s",
+            "Affichage : couleurs=%s raies=%s normalisé=%s",
             self.spectrum_color_checkbox.value, self.spectrum_lines_checkbox.value,
+            self.spectrum_normalize_checkbox.value,
         )
         self._render_spectrum()
 
