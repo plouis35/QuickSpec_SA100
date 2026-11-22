@@ -803,7 +803,7 @@ class ContrastCutsTests(unittest.TestCase):
         self.assertEqual(toolbar[0].content, "Ouvrir des images")
         self.assertEqual(toolbar[1].content, "Sélection des points")
         self.assertIn(app.cut_slider, toolbar[2].controls)
-        self.assertIs(toolbar[3], app.rectified_checkbox)
+        self.assertIn(app.rectified_checkbox, toolbar[2].controls)  # groupée avec le curseur
 
     def test_slider_release_recomputes_levels_and_auto_restores_them(self) -> None:
         from plotting import cut_position
