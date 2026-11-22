@@ -209,29 +209,3 @@ def save_parameters(path: Path, parameters: AppParameters) -> None:
     )
     temporary.replace(path)
     logger.info("Paramètres enregistrés dans %s", path)
-
-
-def read_last_directory(location_file: Path) -> str:
-    """Dernier répertoire d'image ouvert s'il existe encore, sinon le dossier personnel."""
-    try:
-        location = location_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        location = ""
-    except OSError:
-        logger.warning("Lecture du dernier répertoire impossible : %s", location_file)
-        location = ""
-    if location and Path(location).is_dir():
-        logger.info("Dernier répertoire restauré : %s", location)
-        return location
-    logger.info("Pas de dernier répertoire valide : dossier personnel")
-    return str(Path.home())
-
-
-def write_last_directory(location_file: Path, directory: str) -> None:
-    """Mémorise le dernier répertoire d'image ouvert."""
-    try:
-        location_file.parent.mkdir(parents=True, exist_ok=True)
-        location_file.write_text(directory, encoding="utf-8")
-        logger.debug("Dernier répertoire mémorisé : %s", directory)
-    except OSError:
-        logger.warning("Enregistrement du dernier répertoire impossible", exc_info=True)

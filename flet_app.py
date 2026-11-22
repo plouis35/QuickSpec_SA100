@@ -38,9 +38,7 @@ from settings import (
     PARAM_SPECS,
     AppParameters,
     load_parameters,
-    read_last_directory,
     save_parameters,
-    write_last_directory,
 )
 from response import apply_response, compute_response, load_response, save_response
 from spectra_processing import Spectra, refine_centroid
@@ -181,7 +179,6 @@ class QuickSpecFletApp:
         self.tabs: ft.Tabs | None = None
         self.tab_pages: list[ft.Control] = []
 
-        self.location_file = Path.home() / ".quickspec-sa100" / "last-image-location.txt"
         self.parameters_file = Path.home() / ".quickspec-sa100" / "parameters.json"
         self.parameters = AppParameters()
         self.parameter_load_error = self._load_saved_parameters()
@@ -191,7 +188,8 @@ class QuickSpecFletApp:
         self._spectrum_plot_size: StageSize | None = None  # zone d'affichage mesurée
         self._spectrum_sequence = 0
         self.current_image_label = "Image"
-        self.last_directory: str = self._read_last_directory()
+        # Dernier dossier utilisé pendant ce lancement seulement (dossier personnel au départ).
+        self.last_directory: str = str(Path.home())
         self.stage_size: StageSize = (800.0, 480.0)  # zone image, remplacée par la mesure
         self._stage_measured = False
         self._previews: list[tuple[object, str]] = []  # cache (tableau source, data URI)
@@ -695,7 +693,6 @@ class QuickSpecFletApp:
                 raise ValueError("Le sélecteur n’a pas fourni de chemin de fichier.")
             paths = [Path(file.path) for file in selected]
             self.last_directory = str(paths[0].parent)
-            self._save_last_directory()
             self._show_image_status(f"Chargement de {len(paths)} image(s)…")
             # Lecture, corrections et recalage dans un thread : l'interface reste réactive.
             data = await asyncio.to_thread(self._compute_stack, paths)
@@ -1035,7 +1032,6 @@ class QuickSpecFletApp:
             raise ValueError("Le sélecteur n’a pas fourni de chemin de fichier.")
         paths = [Path(file.path) for file in selected]
         self.last_directory = str(paths[0].parent)
-        self._save_last_directory()
         return paths
 
     def _show_spectrum_message(self, message: str) -> None:
@@ -1207,12 +1203,6 @@ class QuickSpecFletApp:
         if self.image_status is not None:
             self.image_status.value = message
             self.image_status.update()
-
-    def _read_last_directory(self) -> str:
-        return read_last_directory(self.location_file)
-
-    def _save_last_directory(self) -> None:
-        write_last_directory(self.location_file, self.last_directory)
 
 
 def main(page: ft.Page) -> None:

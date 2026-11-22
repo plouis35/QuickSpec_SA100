@@ -590,17 +590,6 @@ class FletImageTests(unittest.TestCase):
         self.assertEqual({c.bgcolor for c in lines}, {"#ff2020", "#3b82f6"})
         self.assertEqual(len(app.image_stack.controls), 5)  # image + 4 lignes, plus de croix
 
-    def test_last_picker_directory_is_persisted(self) -> None:
-        """Persist the most recently used image directory."""
-        app = QuickSpecFletApp()
-        with TemporaryDirectory() as directory:
-            app.location_file = Path(directory) / "settings" / "last-image-location.txt"
-            app.last_directory = directory
-
-            app._save_last_directory()
-
-            self.assertEqual(app.location_file.read_text(), directory)
-
 
 class DynamicSizeTests(unittest.TestCase):
     """Vérifie que image et graphe suivent la taille mesurée de leur conteneur."""
